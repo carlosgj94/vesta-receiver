@@ -81,3 +81,22 @@ fn rejects_protocol_errors_with_nonzero_status() {
     let stderr = String::from_utf8(output.stderr).expect("diagnostics should be UTF-8");
     assert!(stderr.contains("unsupported frame version: 2"));
 }
+
+#[cfg(target_os = "linux")]
+#[test]
+fn reports_output_flush_failures() {
+    let full = std::fs::OpenOptions::new()
+        .write(true)
+        .open("/dev/full")
+        .expect("Linux should provide /dev/full");
+    let output = receiver()
+        .args(["decode", FIXTURE])
+        .stdout(Stdio::from(full))
+        .stderr(Stdio::piped())
+        .output()
+        .expect("receiver should start");
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8(output.stderr).expect("diagnostics should be UTF-8");
+    assert!(stderr.contains("could not flush output"));
+}

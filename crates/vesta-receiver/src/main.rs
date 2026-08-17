@@ -58,12 +58,23 @@ fn main() -> ExitCode {
     let mut output = io::BufWriter::new(stdout.lock());
     let mut diagnostics = stderr.lock();
 
-    match run(cli, stdin.lock(), &mut output, &mut diagnostics) {
-        Ok(()) => ExitCode::SUCCESS,
-        Err(error) => {
-            let _ = writeln!(diagnostics, "error: {error}");
-            ExitCode::FAILURE
-        }
+    let run_result = run(cli, stdin.lock(), &mut output, &mut diagnostics);
+    let flush_result = output.flush();
+    let mut succeeded = true;
+
+    if let Err(error) = run_result {
+        let _ = writeln!(diagnostics, "error: {error}");
+        succeeded = false;
+    }
+    if let Err(error) = flush_result {
+        let _ = writeln!(diagnostics, "error: could not flush output: {error}");
+        succeeded = false;
+    }
+
+    if succeeded {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::FAILURE
     }
 }
 
