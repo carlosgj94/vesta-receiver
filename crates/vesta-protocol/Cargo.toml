@@ -1,0 +1,18 @@
+[package]
+name = "vesta-protocol"
+description = "Wire-format types and codec for Vesta environmental telemetry"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+publish.workspace = true
+
+[features]
+default = []
+std = []
+
+[dependencies]
+
+[lints]
+workspace = true
+
