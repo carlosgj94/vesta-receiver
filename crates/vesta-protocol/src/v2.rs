@@ -878,7 +878,9 @@ fn validate_profile(scan: &ProfileScan) -> Result<(), Error> {
         let expected_present = index < usize::from(scan.expected_step_count)
             && scan.missing_steps_bitmap & (1 << index) == 0;
         match (expected_present, scan.steps[index]) {
-            (true, Some(step)) if usize::from(step.step_index) == index => {}
+            (true, Some(step)) if usize::from(step.step_index) == index => {
+                validate_profile_step(&step)?;
+            }
             (false, None) => {}
             _ => return Err(Error::InvalidField("profile_step_presence")),
         }
@@ -1020,7 +1022,25 @@ fn decode_step(bytes: &[u8]) -> Result<ProfileStep, Error> {
         gas_wait: reader.u8()?,
     };
     reader.finish()?;
+    validate_profile_step(&step)?;
     Ok(step)
+}
+
+fn validate_profile_step(step: &ProfileStep) -> Result<(), Error> {
+    let raw_known_status = (step.raw_measurement_status & 0x80) | (step.raw_gas_status & 0x30);
+    if step.status & 0xb0 != raw_known_status {
+        return Err(Error::InvalidField("step_status_raw"));
+    }
+    if step.gas_index != step.raw_measurement_status & 0x0f {
+        return Err(Error::InvalidField("step_gas_index_raw"));
+    }
+    if step.gas_range != step.raw_gas_status & 0x0f {
+        return Err(Error::InvalidField("step_gas_range_raw"));
+    }
+    if step.gas_index != step.step_index {
+        return Err(Error::InvalidField("step_gas_index"));
+    }
+    Ok(())
 }
 
 fn encode_header(
@@ -1833,8 +1853,8 @@ mod tests {
             gas_index: index,
             measurement_index: 0x80_u8.wrapping_add(index),
             status: 0xb0,
-            raw_measurement_status: 0x80,
-            raw_gas_status: 0x30,
+            raw_measurement_status: 0x80 | index,
+            raw_gas_status: 0x3d,
             target_temperature_celsius: 200 + u16::from(index) * 20,
             configured_duration_us: 138_898 * (u32::from(index) + 1),
             offset_us: 1_000_000 * u32::from(index),
@@ -2047,7 +2067,8 @@ mod tests {
             pressure_adc: u32::MAX,
             humidity_adc: u16::MAX,
             gas_resistance_adc: u16::MAX,
-            gas_range: u8::MAX,
+            raw_gas_status: 0x3f,
+            gas_range: 0x0f,
             heater_resistance: u8::MAX,
             heater_current: u8::MAX,
             gas_wait: u8::MAX,
@@ -2091,6 +2112,53 @@ mod tests {
                 actual: original.len() - 1,
             })
         );
+    }
+
+    #[test]
+    fn profile_steps_reject_decoded_raw_contradictions_on_encode_and_decode() {
+        for (field, kind) in [
+            ("step_status_raw", 0_usize),
+            ("step_gas_index_raw", 1),
+            ("step_gas_range_raw", 2),
+            ("step_gas_index", 3),
+        ] {
+            let mut scan = complete_scan();
+            let step = scan.steps[0].as_mut().unwrap();
+            match kind {
+                0 => step.raw_gas_status ^= 0x20,
+                1 => step.raw_measurement_status ^= 1,
+                2 => step.raw_gas_status ^= 1,
+                3 => {
+                    step.gas_index = 1;
+                    step.raw_measurement_status =
+                        (step.raw_measurement_status & 0xf0) | step.gas_index;
+                }
+                _ => unreachable!(),
+            }
+            assert_eq!(
+                encode_profile(common(7), &scan),
+                Err(Error::InvalidField(field))
+            );
+
+            let valid = encode_profile(common(7), &complete_scan()).unwrap();
+            let mut malformed = valid.frames()[0];
+            let step_offset = HEADER_LEN + PROFILE_FRAGMENT_META_LEN;
+            match kind {
+                0 => malformed.bytes[step_offset + 5] ^= 0x20,
+                1 => malformed.bytes[step_offset + 4] ^= 1,
+                2 => malformed.bytes[step_offset + 5] ^= 1,
+                3 => {
+                    malformed.bytes[step_offset + 1] = 1;
+                    malformed.bytes[step_offset + 4] =
+                        (malformed.bytes[step_offset + 4] & 0xf0) | 1;
+                }
+                _ => unreachable!(),
+            }
+            assert_eq!(
+                decode(malformed.as_slice()),
+                Err(Error::InvalidField(field))
+            );
+        }
     }
 
     #[test]
@@ -2348,10 +2416,10 @@ mod tests {
         )
         .unwrap();
         const CONFIG_HEX: &str = "565302013003000100b701020304050607081112131415161718ffffffff212223242526272896392f014bce77450005010302030401a0a1a2a3a4a5a6a76101760205010008030100637300017c1c0000a27600a331ea100100020a03ff01b0b1b2b3b4b5b6b70000ea6000100533be27a005070001e848040500080001001424e70300c800021e920120604000dc00043d240221614100f000065bb603226242010400087a48042363430118000a98da05246444012c000cb76c062565450140000ed5fe0726664601540010f4900827674701680013132209286848017c001531b40a296949";
-        const PROFILE0_HEX: &str = "565302023003000400b701020304050607081112131415161718ffffffff21222324252627289999aaaabbbbcccc00050103100100020a0a000a0000000000bc4b20000000000000000000000000000000000000000000000700000080b0803000c800021e9200000000fc18000186a000009c40000027100007a120000493e04e2001f40d0160aa40010181b0803000dc00043d24000f4240fc19000186a100009c41000027110007a121000493e14e2101f50d0261aa41020282b0803000f000065bb6001e8480fc1a000186a200009c42000027120007a122000493e24e2201f60d0362aa42";
-        const PROFILE1_HEX: &str = "565302023003010400b701020304050607081112131415161718ffffffff21222324252627289999aaaabbbbcccc00050103100100020a0a000a0000000000bc4b20000000000000000000000000000000000000000000000703030383b08030010400087a48002dc6c0fc1b000186a300009c43000027130007a123000493e34e2301f70d0463aa43040484b080300118000a98da003d0900fc1c000186a400009c44000027140007a124000493e44e2401f80d0564aa44050585b08030012c000cb76c004c4b40fc1d000186a500009c45000027150007a125000493e54e2501f90d0665aa45";
-        const PROFILE2_HEX: &str = "565302023003020400b701020304050607081112131415161718ffffffff21222324252627289999aaaabbbbcccc00050103100100020a0a000a0000000000bc4b20000000000000000000000000000000000000000000000706060686b080300140000ed5fe005b8d80fc1e000186a600009c46000027160007a126000493e64e2601fa0d0766aa46070787b0803001540010f490006acfc0fc1f000186a700009c47000027170007a127000493e74e2701fb0d0867aa47080888b08030016800131322007a1200fc20000186a800009c48000027180007a128000493e84e2801fc0d0968aa48";
-        const PROFILE3_HEX: &str = "5653020230030304005901020304050607081112131415161718ffffffff21222324252627289999aaaabbbbcccc00050101100100020a0a000a0000000000bc4b20000000000000000000000000000000000000000000000709090989b08030017c001531b400895440fc21000186a900009c49000027190007a129000493e94e2901fd0d0a69aa49";
+        const PROFILE0_HEX: &str = "565302023003000400b701020304050607081112131415161718ffffffff21222324252627289999aaaabbbbcccc00050103100100020a0a000a0000000000bc4b20000000000000000000000000000000000000000000000700000080b0803d00c800021e9200000000fc18000186a000009c40000027100007a120000493e04e2001f40d0160aa40010181b0813d00dc00043d24000f4240fc19000186a100009c41000027110007a121000493e14e2101f50d0261aa41020282b0823d00f000065bb6001e8480fc1a000186a200009c42000027120007a122000493e24e2201f60d0362aa42";
+        const PROFILE1_HEX: &str = "565302023003010400b701020304050607081112131415161718ffffffff21222324252627289999aaaabbbbcccc00050103100100020a0a000a0000000000bc4b20000000000000000000000000000000000000000000000703030383b0833d010400087a48002dc6c0fc1b000186a300009c43000027130007a123000493e34e2301f70d0463aa43040484b0843d0118000a98da003d0900fc1c000186a400009c44000027140007a124000493e44e2401f80d0564aa44050585b0853d012c000cb76c004c4b40fc1d000186a500009c45000027150007a125000493e54e2501f90d0665aa45";
+        const PROFILE2_HEX: &str = "565302023003020400b701020304050607081112131415161718ffffffff21222324252627289999aaaabbbbcccc00050103100100020a0a000a0000000000bc4b20000000000000000000000000000000000000000000000706060686b0863d0140000ed5fe005b8d80fc1e000186a600009c46000027160007a126000493e64e2601fa0d0766aa46070787b0873d01540010f490006acfc0fc1f000186a700009c47000027170007a127000493e74e2701fb0d0867aa47080888b0883d016800131322007a1200fc20000186a800009c48000027180007a128000493e84e2801fc0d0968aa48";
+        const PROFILE3_HEX: &str = "5653020230030304005901020304050607081112131415161718ffffffff21222324252627289999aaaabbbbcccc00050101100100020a0a000a0000000000bc4b20000000000000000000000000000000000000000000000709090989b0893d017c001531b400895440fc21000186a900009c49000027190007a129000493e94e2901fd0d0a69aa49";
         const HEALTH_HEX: &str = "5653020330000001003601020304050607080000000000000000ffffffff21222324252627289999aaaabbbbcccc0005013f1234567800000064000000020000000300000004000000050000000600000007000000080000ea60020304100100020009000a00";
 
         assert_eq!(hex(config_frame.as_slice()), CONFIG_HEX);

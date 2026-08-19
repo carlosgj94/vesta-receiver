@@ -100,6 +100,9 @@ pub enum FragmentEvent {
 pub struct IngestResult {
     pub event: FragmentEvent,
     pub evicted: Option<ReassembledProfile>,
+    /// Durable snapshot required when an active scan observes a duplicate or
+    /// conflict. `None` for pending/completed events and completed-cache hits.
+    pub integrity_snapshot: Option<ReassembledProfile>,
 }
 
 /// Failure before a fragment can be incorporated.
@@ -216,6 +219,7 @@ impl ProfileReassembler {
             return Ok(IngestResult {
                 event,
                 evicted: None,
+                integrity_snapshot: None,
             });
         }
 
@@ -238,12 +242,14 @@ impl ProfileReassembler {
             .or_insert_with(|| ActiveProfile::new(&owned, observed_at));
         if active.metadata != owned.metadata {
             active.conflicting_fragment_count = active.conflicting_fragment_count.saturating_add(1);
+            let integrity_snapshot = Some(active.snapshot());
             return Ok(IngestResult {
                 event: FragmentEvent::Conflict {
                     key,
                     fragment_index: owned.fragment_index,
                 },
                 evicted,
+                integrity_snapshot,
             });
         }
 
@@ -263,7 +269,12 @@ impl ProfileReassembler {
                     fragment_index: owned.fragment_index,
                 }
             };
-            return Ok(IngestResult { event, evicted });
+            let integrity_snapshot = Some(active.snapshot());
+            return Ok(IngestResult {
+                event,
+                evicted,
+                integrity_snapshot,
+            });
         }
 
         active.received_fragment_bitmap |= 1 << owned.fragment_index;
@@ -290,6 +301,7 @@ impl ProfileReassembler {
             Ok(IngestResult {
                 event: FragmentEvent::Complete(profile),
                 evicted,
+                integrity_snapshot: None,
             })
         } else {
             Ok(IngestResult {
@@ -299,6 +311,7 @@ impl ProfileReassembler {
                     missing_fragment_bitmap: expected_mask & !active.received_fragment_bitmap,
                 }),
                 evicted,
+                integrity_snapshot: None,
             })
         }
     }
@@ -338,6 +351,44 @@ impl ProfileReassembler {
     #[must_use]
     pub fn active_len(&self) -> usize {
         self.active.len()
+    }
+
+    /// Whether this exact logical scan is currently being reassembled.
+    #[must_use]
+    pub fn contains_active(&self, key: ProfileKey) -> bool {
+        self.active.contains_key(&key)
+    }
+
+    /// Forget all volatile state for one logical key before replaying salvaged
+    /// durable source fragments.
+    pub fn discard(&mut self, key: ProfileKey) {
+        self.active.remove(&key);
+        self.completed.retain(|profile| profile.key != key);
+    }
+
+    /// Restore durable receiver-observed duplicate/conflict counters after an
+    /// incomplete profile is rehydrated from `SQLite`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ReassemblyError::InternalState`] if the profile is not active.
+    pub fn restore_receiver_counts(
+        &mut self,
+        key: ProfileKey,
+        duplicate_fragment_count: u16,
+        conflicting_fragment_count: u16,
+    ) -> Result<(), ReassemblyError> {
+        let active = self
+            .active
+            .get_mut(&key)
+            .ok_or(ReassemblyError::InternalState)?;
+        active.duplicate_fragment_count = active
+            .duplicate_fragment_count
+            .saturating_add(duplicate_fragment_count);
+        active.conflicting_fragment_count = active
+            .conflicting_fragment_count
+            .saturating_add(conflicting_fragment_count);
+        Ok(())
     }
 }
 
@@ -408,7 +459,7 @@ impl OwnedFragment {
     }
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 struct ActiveProfile {
     metadata: ProfileMetadata,
     fragments: Vec<Option<OwnedFragment>>,
@@ -471,6 +522,10 @@ impl ActiveProfile {
             },
             fragments: self.sources,
         }
+    }
+
+    fn snapshot(&self) -> ReassembledProfile {
+        self.clone().finish()
     }
 }
 
@@ -664,8 +719,8 @@ mod tests {
             gas_index: index,
             measurement_index: index,
             status: 0xb0,
-            raw_measurement_status: 0x80,
-            raw_gas_status: 0x30,
+            raw_measurement_status: 0x80 | index,
+            raw_gas_status: 0x35,
             target_temperature_celsius: 200 + u16::from(index),
             configured_duration_us: 100_000,
             offset_us: u32::from(index) * 100_000,

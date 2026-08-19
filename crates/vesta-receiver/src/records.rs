@@ -179,6 +179,40 @@ impl ProfileStep {
         self.status_bits
             & !(Self::STATUS_NEW_DATA | Self::STATUS_GAS_VALID | Self::STATUS_HEATER_STABLE)
     }
+
+    fn validate_raw_consistency(self) -> Result<(), RecordError> {
+        let raw_known_status = (self.raw_measurement_status & 0x80) | (self.raw_gas_status & 0x30);
+        if self.status_bits & 0xb0 != raw_known_status {
+            return Err(RecordError::StatusRawMismatch {
+                step_index: self.step_index,
+                status: self.status_bits,
+                raw_known_status,
+            });
+        }
+        let raw_gas_index = self.raw_measurement_status & 0x0f;
+        if self.gas_index != raw_gas_index {
+            return Err(RecordError::GasIndexRawMismatch {
+                step_index: self.step_index,
+                gas_index: self.gas_index,
+                raw_gas_index,
+            });
+        }
+        let raw_gas_range = self.raw_gas_status & 0x0f;
+        if self.raw_gas_range != raw_gas_range {
+            return Err(RecordError::GasRangeRawMismatch {
+                step_index: self.step_index,
+                gas_range: self.raw_gas_range,
+                raw_gas_range,
+            });
+        }
+        if self.gas_index != self.step_index {
+            return Err(RecordError::GasIndexStepMismatch {
+                step_index: self.step_index,
+                gas_index: self.gas_index,
+            });
+        }
+        Ok(())
+    }
 }
 
 /// One complete or explicitly transport-incomplete heater-profile scan.
@@ -298,6 +332,7 @@ impl ProfileScan {
             if observed & bit != 0 {
                 return Err(RecordError::DuplicateStepIndex(step.step_index));
             }
+            step.validate_raw_consistency()?;
             let fragment_index = step.step_index / 3;
             if self.received_fragment_bitmap & (1 << fragment_index) == 0 {
                 return Err(RecordError::StepFromMissingFragment {
@@ -399,6 +434,25 @@ pub enum RecordError {
         expected_steps: u8,
     },
     DuplicateStepIndex(u8),
+    StatusRawMismatch {
+        step_index: u8,
+        status: u8,
+        raw_known_status: u8,
+    },
+    GasIndexRawMismatch {
+        step_index: u8,
+        gas_index: u8,
+        raw_gas_index: u8,
+    },
+    GasRangeRawMismatch {
+        step_index: u8,
+        gas_range: u8,
+        raw_gas_range: u8,
+    },
+    GasIndexStepMismatch {
+        step_index: u8,
+        gas_index: u8,
+    },
     StepFromMissingFragment {
         step_index: u8,
         fragment_index: u8,
@@ -440,8 +494,8 @@ mod tests {
             gas_index: index,
             measurement_index: index,
             status_bits: 0xb0,
-            raw_measurement_status: 0x80,
-            raw_gas_status: 0x30,
+            raw_measurement_status: 0x80 | index,
+            raw_gas_status: 0x35,
             target_temperature_celsius: 300,
             configured_duration_us: 138_898,
             relative_offset_us: index as u32 * 138_898,
@@ -520,7 +574,46 @@ mod tests {
         assert!(measurement.is_gas_valid());
         assert!(measurement.is_heater_stable());
         assert_eq!(measurement.raw_measurement_status, 0x80);
-        assert_eq!(measurement.raw_gas_status, 0x30);
+        assert_eq!(measurement.raw_gas_status, 0x35);
         assert_eq!(identity().boot_id, u64::MAX);
+    }
+
+    #[test]
+    fn rejects_contradictions_between_decoded_and_raw_bosch_fields() {
+        let complete = complete_scan();
+
+        let mut status = complete.clone();
+        status.steps[0].raw_gas_status &= !0x20;
+        assert!(matches!(
+            status.validate(),
+            Err(RecordError::StatusRawMismatch { step_index: 0, .. })
+        ));
+
+        let mut gas_index = complete.clone();
+        gas_index.steps[1].raw_measurement_status =
+            (gas_index.steps[1].raw_measurement_status & 0xf0) | 2;
+        assert!(matches!(
+            gas_index.validate(),
+            Err(RecordError::GasIndexRawMismatch { step_index: 1, .. })
+        ));
+
+        let mut gas_range = complete.clone();
+        gas_range.steps[2].raw_gas_status ^= 1;
+        assert!(matches!(
+            gas_range.validate(),
+            Err(RecordError::GasRangeRawMismatch { step_index: 2, .. })
+        ));
+
+        let mut step_index = complete;
+        step_index.steps[3].gas_index = 2;
+        step_index.steps[3].raw_measurement_status =
+            (step_index.steps[3].raw_measurement_status & 0xf0) | 2;
+        assert_eq!(
+            step_index.validate(),
+            Err(RecordError::GasIndexStepMismatch {
+                step_index: 3,
+                gas_index: 2,
+            })
+        );
     }
 }

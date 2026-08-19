@@ -87,26 +87,52 @@ For each chronological, usable sample, `TemporalFeatureExtractor` produces:
   exact configuration/profile revision, and heater step;
 - temperature, humidity, pressure, and log-gas rates per minute.
 
+Protocol-v2 ordering and elapsed time use the device's scan-start uptime plus
+the per-step MCU field-read/poll offset. Receiver Unix time is retained as
+arrival provenance but cannot distort rates when packets are delayed or arrive
+out of order. The offset is an observation/read-time upper bound, not the
+BME688's exact conversion timestamp. Legacy v1 has no uptime and therefore
+continues to use receiver time. Within one exact valid-boot/profile/step series,
+a newer v2 sample must have `prior_sequence + 1` with wrapping arithmetic;
+otherwise history is cleared and the sample becomes a fresh baseline. This
+prevents an unreceived reconfiguration scan or ordinary packet gap from being
+silently bridged by a derivative. `u32::MAX -> 0` remains continuous.
+
 An unavailable v2 boot nonce is represented as absent and is never entered in
 temporal history, because a quick reboot cannot otherwise be distinguished.
-Legacy v1 retains its separate legacy history behavior.
+It also fails the final per-profile analysis-ready gate: raw storage remains
+useful, but identical sequence/uptime/config tuples can collide across quick
+boots. Legacy v1 retains its separate legacy history behavior.
 
 For a heater-profile scan, `extract_profile_features` preserves the ordered
 per-step log-gas response and its offset from the scan mean. The step vector,
 config ID, profile ID, and profile revision must remain together: measurements
 from different sensor/heater definitions are not directly comparable.
-`usable_for_analysis` additionally requires a complete collector finish,
-complete transport, no missing steps, no critical collection flags or
+`profile_quality_usable` requires a complete collector finish, complete
+transport, no missing steps, no critical collection flags or
 overwrite/index/rollover evidence, and valid status/range checks for every
-terminal step. Expected duplicate/intermediate observations from polling the
+terminal step. Nonzero out-of-order and ambiguous-index-jump counters reject a
+scan directly even if a malformed producer omitted the corresponding summary
+flag. This gate is necessary but not sufficient: a server must also
+join a validated `DeviceConfiguration` matching the node, config ID, profile
+ID/revision, expected step count, and every received step's target temperature,
+duration, and repetition multiplier. Final resolution requires the sensor
+configuration-read-back flag and a readback-valid bitmap covering every
+expected step; every raw heater-current, heater-resistance, and gas-wait byte
+must then match its step descriptor. `extract_profile_features` therefore
+leaves `configuration_resolved=false` and final `usable_for_analysis=false`;
+`extract_profile_features_with_configuration` sets them only for a validated
+match. The features can be recomputed when a repeated configuration packet
+arrives later, so temporary config packet loss does not permanently reject the
+raw profile. Expected duplicate/intermediate observations from polling the
 three BME688 field slots remain diagnostics and do not alone reject a complete
 terminal profile. The explicit stale-pre-scan-fields flag is conservatively
 critical even though its discarded count shares `intermediate_field_count`;
 raw records are still retained when this gate fails. A verified pre-scan
-sensor reconfiguration remains usable because the exact configuration was read
-back before the trigger, but it clears that series' prior temporal history:
-the recovered scan becomes a fresh baseline and no derivative bridges the
-sensor reset.
+sensor reconfiguration remains quality-usable because the exact configuration
+was read back before the trigger, but it clears that series' prior temporal
+history: the recovered scan becomes a fresh baseline and no derivative bridges
+the sensor reset.
 
 ## Version-2 receiver behavior
 
@@ -114,22 +140,38 @@ The implemented receiver:
 
 1. dispatches on magic/version and validates every v2 type, length, flag,
    fragment coordinate, config hash, step window, and optional health TLV;
-2. archives each PHY-valid packet before logical processing;
+2. commits configuration and health raw packets together with their logical
+   rows in one SQLite transaction; profile fragments use a durable `pending`
+   archive state so a crash between archive and reassembly is replayable;
 3. reassembles profiles by `(node_id, boot_id_valid, boot_id, scan_sequence,
    scan_start_uptime_ms, config_id)` with bounded memory, a 120-second expiry,
    fixed 3/3/3/1 windows, and explicit duplicate/conflict/missing outcomes;
-4. replays a fail-closed maximum of 1,024 archived pending fragments before
-   opening the radio, completing scans across a receiver-process restart;
+4. rehydrates persisted transport-incomplete scans and replays a fail-closed
+   maximum of 1,024 archived pending fragments before opening the radio,
+   completing scans across receiver-process restart and cache expiry;
+   pending packets or persisted-incomplete sources that no longer decode or
+   pass semantic reassembly are atomically quarantined as invalid with exact
+   bytes and an error retained. Contaminated same-key partial rows are removed
+   together, while their other valid source packets return to bounded pending
+   replay, so one poison packet cannot prevent startup or orphan its peers;
 5. expires live state using monotonic elapsed time, while preserving Unix
    receive timestamps only as source-record provenance;
 6. persists complete profiles immediately and incomplete profiles on expiry,
-   capacity eviction, or graceful shutdown;
+   capacity eviction, or graceful shutdown; later complementary fragments
+   atomically replace the older partial snapshot without deleting raw packets;
 7. keeps receiver timestamp/RSSI/SNR solely on source-fragment rows;
-8. checks every new/replayed fragment against persisted complete scans using
-   the full logical key and exact archived payload; late duplicates/conflicts
-   update both query columns and canonical JSON, and a conflict emits a
+8. checks every new/replayed fragment against persisted complete or incomplete
+   scans using the full logical key and exact archived payload; late
+   duplicates/conflicts update both query columns and canonical JSON, survive
+   restart into any later completed scan, and a conflict emits a
    machine-readable `profile_integrity_update` invalidation event;
-9. proves v1 byte compatibility plus v2 golden, maximum, malformed,
+9. atomically snapshots receiver duplicate/conflict counters while a profile
+   is still active, so a crash before completion cannot lose a taint already
+   assigned to an archived source packet;
+10. atomically merges and deletes obsolete legacy incomplete rows when a
+    same-key complete scan already exists, preventing counter inflation across
+    repeated restarts;
+11. proves v1 byte compatibility plus v2 golden, maximum, malformed,
    out-of-order, duplicate, missing, and ten-step behavior in host tests.
 
 When the hardware boot nonce is unavailable, scan-start uptime reduces but

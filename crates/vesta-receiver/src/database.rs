@@ -4,7 +4,7 @@ use std::fmt;
 use std::path::Path;
 use std::time::{Duration, SystemTime, SystemTimeError, UNIX_EPOCH};
 
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{Connection, params};
 #[cfg(test)]
 use vesta_protocol::v2::FrameType;
 use vesta_protocol::v2::Header;
@@ -328,9 +328,30 @@ pub struct StoredPacket {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PendingProfileFragment {
     pub packet_id: i64,
+    pub fragment_index: u8,
     pub received_at_unix_ms: i64,
     pub radio: RadioMetadata,
     pub payload: Vec<u8>,
+}
+
+/// One durable transport-incomplete logical scan and the exact raw fragments
+/// needed to restore it after expiry or process restart.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PersistedIncompleteProfile {
+    pub scan_id: i64,
+    pub key: ProfileKey,
+    pub duplicate_fragment_count: u16,
+    pub conflicting_fragment_count: u16,
+    pub fragments: Vec<PendingProfileFragment>,
+}
+
+/// One exact source fragment atomically reconciled while an obsolete partial
+/// profile row was merged into an already complete scan.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PersistedFragmentClassification {
+    pub packet_id: i64,
+    pub fragment_index: u8,
+    pub classification: PersistedFragmentMatch,
 }
 
 /// Identity assigned to one logical protocol-v2 record.
@@ -338,6 +359,13 @@ pub struct PendingProfileFragment {
 pub struct StoredRecord {
     pub id: i64,
     pub received_at_unix_ms: i64,
+}
+
+/// Packet/archive and logical-record identities committed by one transaction.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct StoredV2Record {
+    pub packet: StoredPacket,
+    pub record: StoredRecord,
 }
 
 /// Receiver interpretation of one archived application payload.
@@ -366,7 +394,7 @@ impl PacketDisposition {
 
 /// Exact kind of a successfully decoded protocol-v2 frame.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum V2PacketKind {
+enum V2PacketKind {
     DeviceConfig,
     ProfileFragment,
     DeviceHealth,
@@ -564,17 +592,18 @@ impl TelemetryStore {
         )
     }
 
-    /// Archive a validated v2 frame and attach exact common-header metadata.
+    /// Archive a validated v2 profile fragment and attach exact common-header
+    /// metadata. Configuration and health callers must use their atomic
+    /// archive-plus-logical-record methods instead.
     ///
     /// # Errors
     ///
     /// Returns an error if packet archival or metadata insertion fails.
-    pub fn archive_v2_packet(
+    pub fn archive_v2_profile_fragment(
         &mut self,
         payload: &[u8],
         radio: RadioMetadata,
         header: Header,
-        kind: V2PacketKind,
     ) -> Result<StoredPacket, StorageError> {
         let received_at = current_unix_ms()?;
         let transaction = self.connection.transaction()?;
@@ -588,28 +617,94 @@ impl TelemetryStore {
             Some(header.frame_type as u8),
             None,
         )?;
-        transaction.execute(
-            "INSERT INTO v2_packet_decodes (
-                packet_id, frame_type, record_kind, reassembly_status,
-                node_id, boot_id, scan_sequence, uptime_ms, config_id,
-                fragment_index, fragment_count
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
-            params![
-                packet.id,
-                header.frame_type as u8,
-                kind.database_value(),
-                kind.initial_reassembly_status(),
-                hex_u64(header.common.node_id),
-                hex_u64(header.common.boot_id),
-                header.common.scan_sequence,
-                hex_u64(header.common.uptime_ms),
-                hex_u64(header.common.config_id),
-                header.fragment_index,
-                header.fragment_count,
-            ],
+        insert_v2_packet_decode_at(
+            &transaction,
+            packet.id,
+            header,
+            V2PacketKind::ProfileFragment,
         )?;
         transaction.commit()?;
         Ok(packet)
+    }
+
+    /// Atomically archive a validated configuration packet and insert its
+    /// logical configuration plus ordered heater steps.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for invalid configuration structure, timestamp, JSON,
+    /// or `SQLite`. No raw packet remains committed when logical insertion
+    /// fails.
+    pub fn insert_received_device_configuration(
+        &mut self,
+        payload: &[u8],
+        radio: RadioMetadata,
+        header: Header,
+        configuration: &DeviceConfiguration,
+    ) -> Result<StoredV2Record, StorageError> {
+        configuration.validate()?;
+        let record_json = serde_json::to_string(configuration)?;
+        let received_at = current_unix_ms()?;
+        let transaction = self.connection.transaction()?;
+        let packet = insert_packet_at(
+            &transaction,
+            payload,
+            radio,
+            received_at,
+            PacketDisposition::ProtocolV2,
+            Some(vesta_protocol::v2::VERSION_V2),
+            Some(header.frame_type as u8),
+            None,
+        )?;
+        insert_v2_packet_decode_at(&transaction, packet.id, header, V2PacketKind::DeviceConfig)?;
+        let record = insert_device_configuration_at(
+            &transaction,
+            configuration,
+            &record_json,
+            received_at,
+            Some(packet.id),
+        )?;
+        transaction.commit()?;
+        Ok(StoredV2Record { packet, record })
+    }
+
+    /// Atomically archive a validated device-health packet and insert its
+    /// logical health record.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for timestamp, JSON, or `SQLite`. No raw packet remains
+    /// committed when logical insertion fails.
+    pub fn insert_received_device_health(
+        &mut self,
+        payload: &[u8],
+        radio: RadioMetadata,
+        header: Header,
+        health: &DeviceHealth,
+    ) -> Result<StoredV2Record, StorageError> {
+        let record_json = serde_json::to_string(health)?;
+        let received_at = current_unix_ms()?;
+        let transaction = self.connection.transaction()?;
+        let packet = insert_packet_at(
+            &transaction,
+            payload,
+            radio,
+            received_at,
+            PacketDisposition::ProtocolV2,
+            Some(vesta_protocol::v2::VERSION_V2),
+            Some(header.frame_type as u8),
+            None,
+        )?;
+        insert_v2_packet_decode_at(&transaction, packet.id, header, V2PacketKind::DeviceHealth)?;
+        let record = insert_device_health_at(
+            &transaction,
+            health,
+            &record_json,
+            received_at,
+            Some(packet.id),
+        )?;
+        transaction.commit()?;
+        Ok(StoredV2Record { packet, record })
     }
 
     /// Load every archived profile fragment still marked pending, up to a hard
@@ -648,7 +743,8 @@ impl TelemetryStore {
         }
 
         let mut statement = self.connection.prepare(
-            "SELECT packet.id, packet.received_at_unix_ms,
+            "SELECT packet.id, decoded.fragment_index,
+                    packet.received_at_unix_ms,
                     packet.packet_rssi_centi_dbm, packet.snr_centi_db,
                     packet.signal_rssi_centi_dbm, packet.payload
              FROM radio_packets AS packet
@@ -662,31 +758,436 @@ impl TelemetryStore {
             .query_map([limit], |row| {
                 Ok(PendingProfileFragment {
                     packet_id: row.get(0)?,
-                    received_at_unix_ms: row.get(1)?,
+                    fragment_index: row.get(1)?,
+                    received_at_unix_ms: row.get(2)?,
                     radio: RadioMetadata {
-                        packet_rssi_centi_dbm: row.get(2)?,
-                        snr_centi_db: row.get(3)?,
-                        signal_rssi_centi_dbm: row.get(4)?,
+                        packet_rssi_centi_dbm: row.get(3)?,
+                        snr_centi_db: row.get(4)?,
+                        signal_rssi_centi_dbm: row.get(5)?,
                     },
-                    payload: row.get(5)?,
+                    payload: row.get(6)?,
                 })
             })?
             .collect::<Result<Vec<_>, _>>()?;
         Ok(fragments)
     }
 
-    /// Classify a fragment against any already persisted complete profile with
-    /// the same full logical key.
+    /// Atomically remove one poison fragment from startup replay while
+    /// retaining its exact raw packet bytes and a durable decode error.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the packet is no longer a pending profile fragment
+    /// or the `SQLite` transaction fails.
+    pub fn quarantine_pending_profile_fragment(
+        &mut self,
+        packet_id: i64,
+        error: &str,
+    ) -> Result<(), StorageError> {
+        let transaction = self.connection.transaction()?;
+        let changed = transaction.execute(
+            "UPDATE radio_packets
+             SET disposition = 'invalid', decode_error = ?2
+             WHERE id = ?1
+               AND EXISTS (
+                   SELECT 1 FROM v2_packet_decodes
+                   WHERE packet_id = ?1
+                     AND record_kind = 'profile_fragment'
+                     AND reassembly_status = 'pending'
+               )",
+            params![packet_id, error],
+        )?;
+        if changed != 1 {
+            return Err(StorageError::MissingV2Packet { packet_id });
+        }
+        let deleted = transaction.execute(
+            "DELETE FROM v2_packet_decodes
+             WHERE packet_id = ?1
+               AND record_kind = 'profile_fragment'
+               AND reassembly_status = 'pending'",
+            [packet_id],
+        )?;
+        if deleted != 1 {
+            return Err(StorageError::MissingV2Packet { packet_id });
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
+    /// Quarantine one poison source from a persisted incomplete profile and
+    /// atomically dismantle that contaminated logical snapshot.
+    ///
+    /// Exact raw bytes and an error remain on the poison packet. Other source
+    /// packets from every same-key incomplete row return to `pending` so the
+    /// normal bounded startup pass can salvage them after all contaminated
+    /// partial snapshots for that key are deleted.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the source/scan relationship is absent or the
+    /// `SQLite` transaction fails.
+    #[allow(clippy::too_many_lines)]
+    pub fn quarantine_incomplete_profile_fragment(
+        &mut self,
+        scan_id: i64,
+        key: ProfileKey,
+        packet_id: i64,
+        error: &str,
+    ) -> Result<(), StorageError> {
+        let transaction = self.connection.transaction()?;
+        let linked: i64 = transaction.query_row(
+            "SELECT count(*)
+             FROM v2_profile_scans AS scan
+             JOIN v2_profile_fragments AS source ON source.scan_id = scan.id
+             WHERE scan.id = ?1 AND scan.transport_complete = 0
+               AND source.packet_id = ?2",
+            params![scan_id, packet_id],
+            |row| row.get(0),
+        )?;
+        if linked != 1 {
+            return Err(StorageError::MissingV2Packet { packet_id });
+        }
+        let complete_scan_count: i64 = transaction.query_row(
+            "SELECT count(*) FROM v2_profile_scans
+             WHERE transport_complete = 1
+               AND node_id = ?1
+               AND boot_id = ?2
+               AND scan_sequence = ?3
+               AND uptime_ms = ?4
+               AND config_id = ?5
+               AND ((common_flags & 1) != 0) = ?6",
+            params![
+                hex_u64(key.node_id),
+                hex_u64(key.boot_id),
+                key.scan_sequence,
+                hex_u64(key.uptime_ms),
+                hex_u64(key.config_id),
+                i64::from(key.boot_id_valid),
+            ],
+            |row| row.get(0),
+        )?;
+        let mut replay_candidates = {
+            let mut statement = transaction.prepare(
+                "SELECT DISTINCT decoded.packet_id, packet.payload
+                 FROM v2_profile_scans AS scan
+                 JOIN v2_profile_fragments AS source ON source.scan_id = scan.id
+                 JOIN v2_packet_decodes AS decoded ON decoded.packet_id = source.packet_id
+                 JOIN radio_packets AS packet ON packet.id = decoded.packet_id
+                 WHERE scan.transport_complete = 0
+                   AND decoded.record_kind = 'profile_fragment'
+                   AND decoded.reassembly_status IN (
+                       'pending', 'incomplete', 'duplicate', 'conflict'
+                   )
+                   AND decoded.packet_id != ?1
+                   AND scan.node_id = ?2
+                   AND scan.boot_id = ?3
+                   AND scan.scan_sequence = ?4
+                   AND scan.uptime_ms = ?5
+                   AND scan.config_id = ?6
+                   AND ((scan.common_flags & 1) != 0) = ?7",
+            )?;
+            statement
+                .query_map(
+                    params![
+                        packet_id,
+                        hex_u64(key.node_id),
+                        hex_u64(key.boot_id),
+                        key.scan_sequence,
+                        hex_u64(key.uptime_ms),
+                        hex_u64(key.config_id),
+                        i64::from(key.boot_id_valid),
+                    ],
+                    |row| Ok((row.get::<_, i64>(0)?, row.get::<_, Vec<u8>>(1)?)),
+                )?
+                .collect::<Result<Vec<_>, _>>()?
+        };
+
+        // Duplicate/conflict packets are receiver events rather than canonical
+        // source links, so deleting the contaminated snapshot would otherwise
+        // discard its integrity counters. When no completed scan already owns
+        // those classifications, replay every raw-valid exact-key event after
+        // the canonical sources. Packet ids preserve their original arrival
+        // order, allowing reassembly to reconstruct the same counters. If a
+        // completed scan exists, its durable counters already own the events
+        // and requeueing them would count them twice.
+        if complete_scan_count == 0 {
+            let integrity_events = {
+                let mut statement = transaction.prepare(
+                    "SELECT decoded.packet_id, packet.payload
+                     FROM v2_packet_decodes AS decoded
+                     JOIN radio_packets AS packet ON packet.id = decoded.packet_id
+                     WHERE decoded.record_kind = 'profile_fragment'
+                       AND decoded.reassembly_status IN ('duplicate', 'conflict')
+                       AND decoded.packet_id != ?1
+                       AND decoded.node_id = ?2
+                       AND decoded.boot_id = ?3
+                       AND decoded.scan_sequence = ?4
+                       AND decoded.uptime_ms = ?5
+                       AND decoded.config_id = ?6
+                     ORDER BY decoded.packet_id ASC",
+                )?;
+                statement
+                    .query_map(
+                        params![
+                            packet_id,
+                            hex_u64(key.node_id),
+                            hex_u64(key.boot_id),
+                            key.scan_sequence,
+                            hex_u64(key.uptime_ms),
+                            hex_u64(key.config_id),
+                        ],
+                        |row| Ok((row.get::<_, i64>(0)?, row.get::<_, Vec<u8>>(1)?)),
+                    )?
+                    .collect::<Result<Vec<_>, _>>()?
+            };
+            for (candidate_id, payload) in integrity_events {
+                let exact_key = matches!(
+                    vesta_protocol::v2::decode(&payload),
+                    Ok(vesta_protocol::v2::DecodedFrame::ProfileFragment(fragment))
+                        if ProfileKey::from(&fragment.header) == key
+                );
+                if exact_key
+                    && !replay_candidates
+                        .iter()
+                        .any(|(existing_id, _)| *existing_id == candidate_id)
+                {
+                    replay_candidates.push((candidate_id, payload));
+                }
+            }
+            replay_candidates.sort_unstable_by_key(|(candidate_id, _)| *candidate_id);
+        }
+        for (candidate_id, payload) in replay_candidates {
+            let matching_key = matches!(
+                vesta_protocol::v2::decode(&payload),
+                Ok(vesta_protocol::v2::DecodedFrame::ProfileFragment(fragment))
+                    if ProfileKey::from(&fragment.header) == key
+            );
+            if matching_key {
+                transaction.execute(
+                    "UPDATE v2_packet_decodes SET reassembly_status = 'pending'
+                     WHERE packet_id = ?1",
+                    [candidate_id],
+                )?;
+            } else {
+                transaction.execute(
+                    "UPDATE radio_packets
+                     SET disposition = 'invalid',
+                         decode_error = 'same-key incomplete replay validation failed'
+                     WHERE id = ?1",
+                    [candidate_id],
+                )?;
+                transaction.execute(
+                    "DELETE FROM v2_packet_decodes WHERE packet_id = ?1",
+                    [candidate_id],
+                )?;
+            }
+        }
+        let changed = transaction.execute(
+            "UPDATE radio_packets
+             SET disposition = 'invalid', decode_error = ?2
+             WHERE id = ?1",
+            params![packet_id, error],
+        )?;
+        if changed != 1 {
+            return Err(StorageError::MissingV2Packet { packet_id });
+        }
+        transaction.execute(
+            "DELETE FROM v2_packet_decodes WHERE packet_id = ?1",
+            [packet_id],
+        )?;
+        let deleted = transaction.execute(
+            "DELETE FROM v2_profile_scans
+             WHERE transport_complete = 0
+               AND node_id = ?1
+               AND boot_id = ?2
+               AND scan_sequence = ?3
+               AND uptime_ms = ?4
+               AND config_id = ?5
+               AND ((common_flags & 1) != 0) = ?6",
+            params![
+                hex_u64(key.node_id),
+                hex_u64(key.boot_id),
+                key.scan_sequence,
+                hex_u64(key.uptime_ms),
+                hex_u64(key.config_id),
+                i64::from(key.boot_id_valid),
+            ],
+        )?;
+        if deleted == 0 {
+            return Err(StorageError::CorruptIncompleteProfile);
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
+    /// Load every persisted transport-incomplete profile for bounded startup
+    /// recovery.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an invalid/exceeded fragment bound or an `SQLite`
+    /// query failure.
+    pub fn incomplete_profiles(
+        &self,
+        fragment_limit: usize,
+    ) -> Result<Vec<PersistedIncompleteProfile>, StorageError> {
+        self.incomplete_profiles_matching(None, fragment_limit)
+    }
+
+    /// Load persisted transport-incomplete profiles matching one full logical
+    /// profile key. This restores an expired scan before accepting a late
+    /// complementary fragment in the same process.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an invalid/exceeded fragment bound or an `SQLite`
+    /// query failure.
+    pub fn incomplete_profiles_for_key(
+        &self,
+        key: ProfileKey,
+        fragment_limit: usize,
+    ) -> Result<Vec<PersistedIncompleteProfile>, StorageError> {
+        self.incomplete_profiles_matching(Some(key), fragment_limit)
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn incomplete_profiles_matching(
+        &self,
+        key: Option<ProfileKey>,
+        fragment_limit: usize,
+    ) -> Result<Vec<PersistedIncompleteProfile>, StorageError> {
+        let limit = i64::try_from(fragment_limit)
+            .ok()
+            .filter(|limit| *limit > 0)
+            .ok_or(StorageError::InvalidIncompleteReplayLimit)?;
+        let key_filter = if key.is_some() {
+            " AND scan.node_id = ?2
+              AND scan.boot_id = ?3
+              AND scan.scan_sequence = ?4
+              AND scan.uptime_ms = ?5
+              AND scan.config_id = ?6
+              AND ((scan.common_flags & 1) != 0) = ?7"
+        } else {
+            ""
+        };
+        let count_sql = format!(
+            "SELECT count(*)
+             FROM v2_profile_scans AS scan
+             JOIN v2_profile_fragments AS fragment ON fragment.scan_id = scan.id
+             WHERE scan.transport_complete = 0{key_filter}"
+        );
+        let fragment_count: i64 = if let Some(key) = key {
+            self.connection.query_row(
+                &count_sql,
+                params![
+                    limit,
+                    hex_u64(key.node_id),
+                    hex_u64(key.boot_id),
+                    key.scan_sequence,
+                    hex_u64(key.uptime_ms),
+                    hex_u64(key.config_id),
+                    i64::from(key.boot_id_valid),
+                ],
+                |row| row.get(0),
+            )?
+        } else {
+            self.connection
+                .query_row(&count_sql, [], |row| row.get(0))?
+        };
+        if fragment_count > limit {
+            return Err(StorageError::IncompleteReplayLimitExceeded {
+                fragments: fragment_count,
+                limit: fragment_limit,
+            });
+        }
+
+        let select_sql = format!(
+            "SELECT scan.id, scan.duplicate_fragment_count,
+                    scan.conflicting_fragment_count, scan.node_id,
+                    scan.boot_id, scan.scan_sequence, scan.uptime_ms,
+                    scan.config_id, ((scan.common_flags & 1) != 0),
+                    fragment.fragment_index,
+                    packet.id, packet.received_at_unix_ms,
+                    packet.packet_rssi_centi_dbm, packet.snr_centi_db,
+                    packet.signal_rssi_centi_dbm, packet.payload
+             FROM v2_profile_scans AS scan
+             JOIN v2_profile_fragments AS fragment ON fragment.scan_id = scan.id
+             JOIN radio_packets AS packet ON packet.id = fragment.packet_id
+             WHERE scan.transport_complete = 0{key_filter}
+             ORDER BY scan.id ASC, fragment.fragment_index ASC, packet.id ASC
+             LIMIT ?1"
+        );
+        let mut statement = self.connection.prepare(&select_sql)?;
+        let mut rows = if let Some(key) = key {
+            statement.query(params![
+                limit,
+                hex_u64(key.node_id),
+                hex_u64(key.boot_id),
+                key.scan_sequence,
+                hex_u64(key.uptime_ms),
+                hex_u64(key.config_id),
+                i64::from(key.boot_id_valid),
+            ])?
+        } else {
+            statement.query([limit])?
+        };
+        let mut profiles = Vec::<PersistedIncompleteProfile>::new();
+        while let Some(row) = rows.next()? {
+            let scan_id = row.get(0)?;
+            let row_key = ProfileKey {
+                node_id: parse_hex_u64(&row.get::<_, String>(3)?, "node_id")?,
+                boot_id: parse_hex_u64(&row.get::<_, String>(4)?, "boot_id")?,
+                scan_sequence: row.get(5)?,
+                uptime_ms: parse_hex_u64(&row.get::<_, String>(6)?, "uptime_ms")?,
+                config_id: parse_hex_u64(&row.get::<_, String>(7)?, "config_id")?,
+                boot_id_valid: row.get(8)?,
+            };
+            if profiles
+                .last()
+                .is_none_or(|profile| profile.scan_id != scan_id)
+            {
+                profiles.push(PersistedIncompleteProfile {
+                    scan_id,
+                    key: row_key,
+                    duplicate_fragment_count: row.get(1)?,
+                    conflicting_fragment_count: row.get(2)?,
+                    fragments: Vec::new(),
+                });
+            }
+            let profile = profiles
+                .last_mut()
+                .ok_or(StorageError::CorruptIncompleteProfile)?;
+            if profile.key != row_key {
+                return Err(StorageError::CorruptIncompleteProfile);
+            }
+            profile.fragments.push(PendingProfileFragment {
+                packet_id: row.get(10)?,
+                fragment_index: row.get(9)?,
+                received_at_unix_ms: row.get(11)?,
+                radio: RadioMetadata {
+                    packet_rssi_centi_dbm: row.get(12)?,
+                    snr_centi_db: row.get(13)?,
+                    signal_rssi_centi_dbm: row.get(14)?,
+                },
+                payload: row.get(15)?,
+            });
+        }
+        Ok(profiles)
+    }
+
+    /// Classify a fragment against any already persisted profile with the same
+    /// full logical key and fragment index.
     ///
     /// A match updates the new packet's reassembly disposition and saturating
     /// duplicate/conflict counters on every matching persisted scan. Conflict
-    /// updates also make those scans fail the analysis integrity gate. This
-    /// durable check survives receiver restarts and completed-cache expiry.
+    /// updates also make complete or incomplete scans fail the analysis
+    /// integrity gate. This durable check survives receiver restarts and cache
+    /// expiry.
     ///
     /// # Errors
     ///
     /// Returns an error for an `SQLite` query/update or commit failure.
-    pub fn reconcile_completed_profile_fragment(
+    pub fn reconcile_persisted_profile_fragment(
         &mut self,
         key: ProfileKey,
         packet_id: i64,
@@ -708,7 +1209,6 @@ impl TelemetryStore {
                    AND scan.uptime_ms = ?4
                    AND scan.config_id = ?5
                    AND ((scan.common_flags & 1) != 0) = ?6
-                   AND scan.transport_complete = 1
                  ORDER BY scan.id ASC",
             )?;
             statement
@@ -767,6 +1267,173 @@ impl TelemetryStore {
         Ok(Some(classification))
     }
 
+    /// Atomically merge one obsolete transport-incomplete row into any
+    /// already complete scan with the same full key, classify every source
+    /// fragment by exact bytes, and delete the obsolete row.
+    ///
+    /// A committed merge is idempotent across restart because the partial row
+    /// and all of its source links disappear in the same transaction that
+    /// updates complete-scan counters and packet dispositions.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for corrupt source metadata or an `SQLite` failure.
+    #[allow(clippy::too_many_lines)]
+    pub fn coalesce_incomplete_profile_into_completed(
+        &mut self,
+        profile: &PersistedIncompleteProfile,
+    ) -> Result<Option<Vec<PersistedFragmentClassification>>, StorageError> {
+        let transaction = self.connection.transaction()?;
+        let complete_scan_ids = {
+            let mut statement = transaction.prepare(
+                "SELECT id FROM v2_profile_scans
+                 WHERE transport_complete = 1
+                   AND node_id = ?1
+                   AND boot_id = ?2
+                   AND scan_sequence = ?3
+                   AND uptime_ms = ?4
+                   AND config_id = ?5
+                   AND ((common_flags & 1) != 0) = ?6
+                 ORDER BY id ASC",
+            )?;
+            statement
+                .query_map(
+                    params![
+                        hex_u64(profile.key.node_id),
+                        hex_u64(profile.key.boot_id),
+                        profile.key.scan_sequence,
+                        hex_u64(profile.key.uptime_ms),
+                        hex_u64(profile.key.config_id),
+                        i64::from(profile.key.boot_id_valid),
+                    ],
+                    |row| row.get::<_, i64>(0),
+                )?
+                .collect::<Result<Vec<_>, _>>()?
+        };
+        if complete_scan_ids.is_empty() {
+            transaction.commit()?;
+            return Ok(None);
+        }
+
+        let add_snapshot_counts = "UPDATE v2_profile_scans
+             SET duplicate_fragment_count = min(
+                     duplicate_fragment_count + ?2, 65535
+                 ),
+                 conflicting_fragment_count = min(
+                     conflicting_fragment_count + ?3, 65535
+                 ),
+                 record_json = json_set(
+                     record_json,
+                     '$.duplicate_fragment_count',
+                     min(duplicate_fragment_count + ?2, 65535),
+                     '$.conflicting_fragment_count',
+                     min(conflicting_fragment_count + ?3, 65535)
+                 )
+             WHERE id = ?1";
+        for scan_id in &complete_scan_ids {
+            transaction.execute(
+                add_snapshot_counts,
+                params![
+                    scan_id,
+                    profile.duplicate_fragment_count,
+                    profile.conflicting_fragment_count,
+                ],
+            )?;
+        }
+
+        let mut classifications = Vec::with_capacity(profile.fragments.len());
+        for fragment in &profile.fragments {
+            let completed_payloads = {
+                let mut statement = transaction.prepare(
+                    "SELECT packet.payload
+                     FROM v2_profile_scans AS scan
+                     JOIN v2_profile_fragments AS source
+                       ON source.scan_id = scan.id
+                      AND source.fragment_index = ?7
+                     JOIN radio_packets AS packet ON packet.id = source.packet_id
+                     WHERE scan.transport_complete = 1
+                       AND scan.node_id = ?1
+                       AND scan.boot_id = ?2
+                       AND scan.scan_sequence = ?3
+                       AND scan.uptime_ms = ?4
+                       AND scan.config_id = ?5
+                       AND ((scan.common_flags & 1) != 0) = ?6",
+                )?;
+                statement
+                    .query_map(
+                        params![
+                            hex_u64(profile.key.node_id),
+                            hex_u64(profile.key.boot_id),
+                            profile.key.scan_sequence,
+                            hex_u64(profile.key.uptime_ms),
+                            hex_u64(profile.key.config_id),
+                            i64::from(profile.key.boot_id_valid),
+                            fragment.fragment_index,
+                        ],
+                        |row| row.get::<_, Vec<u8>>(0),
+                    )?
+                    .collect::<Result<Vec<_>, _>>()?
+            };
+            if completed_payloads.is_empty() {
+                return Err(StorageError::CorruptIncompleteProfile);
+            }
+            let classification = if completed_payloads
+                .iter()
+                .all(|payload| payload == &fragment.payload)
+            {
+                PersistedFragmentMatch::Duplicate
+            } else {
+                PersistedFragmentMatch::Conflict
+            };
+            let (column, json_path) = match classification {
+                PersistedFragmentMatch::Duplicate => {
+                    ("duplicate_fragment_count", "$.duplicate_fragment_count")
+                }
+                PersistedFragmentMatch::Conflict => {
+                    ("conflicting_fragment_count", "$.conflicting_fragment_count")
+                }
+            };
+            let update = format!(
+                "UPDATE v2_profile_scans
+                 SET {column} = min({column} + 1, 65535),
+                     record_json = json_set(
+                         record_json, '{json_path}', min({column} + 1, 65535)
+                     )
+                 WHERE id = ?1"
+            );
+            for scan_id in &complete_scan_ids {
+                transaction.execute(&update, [scan_id])?;
+            }
+            let changed = transaction.execute(
+                "UPDATE v2_packet_decodes SET reassembly_status = ?1
+                 WHERE packet_id = ?2 AND record_kind = 'profile_fragment'",
+                params![
+                    classification.storage_status().database_value(),
+                    fragment.packet_id
+                ],
+            )?;
+            if changed != 1 {
+                return Err(StorageError::MissingV2Packet {
+                    packet_id: fragment.packet_id,
+                });
+            }
+            classifications.push(PersistedFragmentClassification {
+                packet_id: fragment.packet_id,
+                fragment_index: fragment.fragment_index,
+                classification,
+            });
+        }
+        let deleted = transaction.execute(
+            "DELETE FROM v2_profile_scans WHERE id = ?1 AND transport_complete = 0",
+            [profile.scan_id],
+        )?;
+        if deleted > 1 {
+            return Err(StorageError::CorruptIncompleteProfile);
+        }
+        transaction.commit()?;
+        Ok(Some(classifications))
+    }
+
     /// Update receiver-side reassembly state for an archived fragment.
     ///
     /// # Errors
@@ -790,94 +1457,6 @@ impl TelemetryStore {
         }
     }
 
-    /// Store one exact v2 configuration and its ordered heater descriptors.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error for invalid structure, JSON, timestamps, or `SQLite`.
-    pub fn insert_device_configuration(
-        &mut self,
-        configuration: &DeviceConfiguration,
-        source_packet_id: Option<i64>,
-    ) -> Result<StoredRecord, StorageError> {
-        configuration.validate()?;
-        let received_at = self.packet_or_current_time(source_packet_id)?;
-        let record_json = serde_json::to_string(configuration)?;
-        let transaction = self.connection.transaction()?;
-        transaction.execute(
-            "INSERT INTO v2_device_configurations (
-                received_at_unix_ms, node_id, boot_id, scan_sequence, uptime_ms,
-                config_id, common_flags, reset_cause_flags, repeated,
-                firmware_version, firmware_build_id, sensor_chip_id,
-                sensor_variant, calibration_hash_algorithm, calibration_hash,
-                profile_id, profile_version, expected_step_count,
-                expected_profile_duration_us, scan_interval_ms, output_routes,
-                radio_frequency_hz, radio_tx_power_dbm,
-                radio_spreading_factor, radio_bandwidth_hz, record_json,
-                source_packet_id
-             ) VALUES (
-                ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13,
-                ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24,
-                ?25, ?26, ?27
-             )",
-            params![
-                received_at,
-                hex_u64(configuration.identity.node_id),
-                hex_u64(configuration.identity.boot_id),
-                configuration.identity.scan_sequence,
-                hex_u64(configuration.identity.uptime_ms),
-                hex_u64(configuration.identity.config_id),
-                configuration.identity.common_flags,
-                configuration.identity.reset_cause_flags,
-                configuration.repeated,
-                semver_text(configuration.firmware_version),
-                hex_u64(configuration.firmware_build_id),
-                configuration.sensor_chip_id,
-                configuration.sensor_variant,
-                configuration.calibration_hash_algorithm,
-                hex_u64(configuration.calibration_hash),
-                configuration.profile_id,
-                configuration.profile_version,
-                configuration.expected_step_count,
-                configuration.expected_profile_duration_us,
-                configuration.scan_interval_ms,
-                configuration.output_routes,
-                configuration.radio_frequency_hz,
-                configuration.radio_tx_power_dbm,
-                configuration.radio_spreading_factor,
-                configuration.radio_bandwidth_hz,
-                record_json,
-                source_packet_id,
-            ],
-        )?;
-        let id = transaction.last_insert_rowid();
-        for step in &configuration.heater_steps {
-            transaction.execute(
-                "INSERT INTO v2_heater_profile_steps (
-                    configuration_id, step_index, target_temperature_celsius,
-                    configured_duration_us, repetition_multiplier,
-                    programmed_heater_current, programmed_heater_resistance,
-                    programmed_gas_wait
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-                params![
-                    id,
-                    step.step_index,
-                    step.target_temperature_celsius,
-                    step.configured_duration_us,
-                    step.repetition_multiplier,
-                    step.readback_heater_current,
-                    step.programmed_heater_resistance,
-                    step.programmed_gas_wait,
-                ],
-            )?;
-        }
-        transaction.commit()?;
-        Ok(StoredRecord {
-            id,
-            received_at_unix_ms: received_at,
-        })
-    }
-
     /// Store a complete or transport-incomplete reassembled profile.
     ///
     /// Every unique source fragment retains its own receiver timestamp and
@@ -886,10 +1465,34 @@ impl TelemetryStore {
     /// # Errors
     ///
     /// Returns an error for invalid structure, absent sources, JSON, or `SQLite`.
-    #[allow(clippy::too_many_lines)]
     pub fn insert_profile_scan(
         &mut self,
         profile: &ReassembledProfile,
+    ) -> Result<StoredRecord, StorageError> {
+        self.insert_profile_scan_inner(profile, None)
+    }
+
+    /// Atomically store an active-profile integrity snapshot and classify the
+    /// duplicate/conflicting source packet that changed its receiver counters.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same errors as [`Self::insert_profile_scan`], or an error if
+    /// `packet_id` is not an archived profile fragment.
+    pub fn insert_profile_integrity_snapshot(
+        &mut self,
+        profile: &ReassembledProfile,
+        packet_id: i64,
+        status: FragmentStorageStatus,
+    ) -> Result<StoredRecord, StorageError> {
+        self.insert_profile_scan_inner(profile, Some((packet_id, status)))
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn insert_profile_scan_inner(
+        &mut self,
+        profile: &ReassembledProfile,
+        integrity_packet: Option<(i64, FragmentStorageStatus)>,
     ) -> Result<StoredRecord, StorageError> {
         profile.scan.validate()?;
         let first_received = profile
@@ -901,6 +1504,28 @@ impl TelemetryStore {
         let scan = &profile.scan;
         let record_json = serde_json::to_string(scan)?;
         let transaction = self.connection.transaction()?;
+        // A later complementary fragment may complete a profile that was
+        // already persisted after timeout/eviction. Replace every older
+        // transport-incomplete snapshot for this exact logical key inside the
+        // same transaction, while keeping all archived raw packets intact.
+        transaction.execute(
+            "DELETE FROM v2_profile_scans
+             WHERE transport_complete = 0
+               AND node_id = ?1
+               AND boot_id = ?2
+               AND scan_sequence = ?3
+               AND uptime_ms = ?4
+               AND config_id = ?5
+               AND ((common_flags & 1) != 0) = ?6",
+            params![
+                hex_u64(scan.identity.node_id),
+                hex_u64(scan.identity.boot_id),
+                scan.identity.scan_sequence,
+                hex_u64(scan.identity.uptime_ms),
+                hex_u64(scan.identity.config_id),
+                i64::from(scan.identity.common_flags & 1 != 0),
+            ],
+        )?;
         transaction.execute(
             "INSERT INTO v2_profile_scans (
                 first_received_at_unix_ms, last_received_at_unix_ms, node_id,
@@ -1033,92 +1658,21 @@ impl TelemetryStore {
                 ],
             )?;
         }
+        if let Some((packet_id, status)) = integrity_packet {
+            let changed = transaction.execute(
+                "UPDATE v2_packet_decodes SET reassembly_status = ?1
+                 WHERE packet_id = ?2 AND record_kind = 'profile_fragment'",
+                params![status.database_value(), packet_id],
+            )?;
+            if changed != 1 {
+                return Err(StorageError::MissingV2Packet { packet_id });
+            }
+        }
         transaction.commit()?;
         Ok(StoredRecord {
             id,
             received_at_unix_ms: last_received,
         })
-    }
-
-    /// Store one exact device-health record.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error for timestamp, JSON, or `SQLite` failures.
-    pub fn insert_device_health(
-        &self,
-        health: &DeviceHealth,
-        source_packet_id: Option<i64>,
-    ) -> Result<StoredRecord, StorageError> {
-        let received_at = self.packet_or_current_time(source_packet_id)?;
-        let record_json = serde_json::to_string(health)?;
-        self.connection.execute(
-            "INSERT INTO v2_device_health (
-                received_at_unix_ms, node_id, boot_id, scan_sequence,
-                uptime_ms, config_id, common_flags, reset_cause_flags,
-                health_flags, reset_cause_raw, successful_sensor_scans,
-                failed_sensor_scans, incomplete_profiles, i2c_errors,
-                radio_tx_errors, dropped_profiles, dropped_fragments,
-                overwritten_fields, current_sample_interval_ms,
-                firmware_version, profile_id, profile_version,
-                last_sensor_error, last_radio_error,
-                calibrated_mcu_temperature_centi_celsius,
-                calibrated_vdd_millivolt, record_json, source_packet_id
-             ) VALUES (
-                ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13,
-                ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24,
-                ?25, ?26, ?27, ?28
-             )",
-            params![
-                received_at,
-                hex_u64(health.identity.node_id),
-                hex_u64(health.identity.boot_id),
-                health.identity.scan_sequence,
-                hex_u64(health.identity.uptime_ms),
-                hex_u64(health.identity.config_id),
-                health.identity.common_flags,
-                health.identity.reset_cause_flags,
-                health.health_flags,
-                health.reset_cause_raw,
-                health.successful_sensor_scans,
-                health.failed_sensor_scans,
-                health.incomplete_profiles,
-                health.i2c_errors,
-                health.radio_tx_errors,
-                health.dropped_profiles,
-                health.dropped_fragments,
-                health.overwritten_fields,
-                health.current_sample_interval_ms,
-                semver_text(health.firmware_version),
-                health.profile_id,
-                health.profile_version,
-                health.last_sensor_error,
-                health.last_radio_error,
-                health.calibrated_mcu_temperature_centi_celsius,
-                health.calibrated_vdd_millivolt,
-                record_json,
-                source_packet_id,
-            ],
-        )?;
-        Ok(StoredRecord {
-            id: self.connection.last_insert_rowid(),
-            received_at_unix_ms: received_at,
-        })
-    }
-
-    fn packet_or_current_time(&self, packet_id: Option<i64>) -> Result<i64, StorageError> {
-        if let Some(packet_id) = packet_id {
-            self.connection
-                .query_row(
-                    "SELECT received_at_unix_ms FROM radio_packets WHERE id = ?1",
-                    [packet_id],
-                    |row| row.get(0),
-                )
-                .optional()?
-                .ok_or(StorageError::MissingV2Packet { packet_id })
-        } else {
-            current_unix_ms()
-        }
     }
 
     #[cfg(test)]
@@ -1167,8 +1721,182 @@ fn hex_u64(value: u64) -> String {
     format!("{value:016x}")
 }
 
+fn parse_hex_u64(value: &str, field: &'static str) -> Result<u64, StorageError> {
+    u64::from_str_radix(value, 16).map_err(|_| StorageError::CorruptHexIdentity { field })
+}
+
 fn semver_text(version: [u8; 3]) -> String {
     format!("{}.{}.{}", version[0], version[1], version[2])
+}
+
+fn insert_v2_packet_decode_at(
+    connection: &Connection,
+    packet_id: i64,
+    header: Header,
+    kind: V2PacketKind,
+) -> Result<(), StorageError> {
+    connection.execute(
+        "INSERT INTO v2_packet_decodes (
+            packet_id, frame_type, record_kind, reassembly_status,
+            node_id, boot_id, scan_sequence, uptime_ms, config_id,
+            fragment_index, fragment_count
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+        params![
+            packet_id,
+            header.frame_type as u8,
+            kind.database_value(),
+            kind.initial_reassembly_status(),
+            hex_u64(header.common.node_id),
+            hex_u64(header.common.boot_id),
+            header.common.scan_sequence,
+            hex_u64(header.common.uptime_ms),
+            hex_u64(header.common.config_id),
+            header.fragment_index,
+            header.fragment_count,
+        ],
+    )?;
+    Ok(())
+}
+
+fn insert_device_configuration_at(
+    connection: &Connection,
+    configuration: &DeviceConfiguration,
+    record_json: &str,
+    received_at: i64,
+    source_packet_id: Option<i64>,
+) -> Result<StoredRecord, StorageError> {
+    connection.execute(
+        "INSERT INTO v2_device_configurations (
+            received_at_unix_ms, node_id, boot_id, scan_sequence, uptime_ms,
+            config_id, common_flags, reset_cause_flags, repeated,
+            firmware_version, firmware_build_id, sensor_chip_id,
+            sensor_variant, calibration_hash_algorithm, calibration_hash,
+            profile_id, profile_version, expected_step_count,
+            expected_profile_duration_us, scan_interval_ms, output_routes,
+            radio_frequency_hz, radio_tx_power_dbm,
+            radio_spreading_factor, radio_bandwidth_hz, record_json,
+            source_packet_id
+         ) VALUES (
+            ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13,
+            ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24,
+            ?25, ?26, ?27
+         )",
+        params![
+            received_at,
+            hex_u64(configuration.identity.node_id),
+            hex_u64(configuration.identity.boot_id),
+            configuration.identity.scan_sequence,
+            hex_u64(configuration.identity.uptime_ms),
+            hex_u64(configuration.identity.config_id),
+            configuration.identity.common_flags,
+            configuration.identity.reset_cause_flags,
+            configuration.repeated,
+            semver_text(configuration.firmware_version),
+            hex_u64(configuration.firmware_build_id),
+            configuration.sensor_chip_id,
+            configuration.sensor_variant,
+            configuration.calibration_hash_algorithm,
+            hex_u64(configuration.calibration_hash),
+            configuration.profile_id,
+            configuration.profile_version,
+            configuration.expected_step_count,
+            configuration.expected_profile_duration_us,
+            configuration.scan_interval_ms,
+            configuration.output_routes,
+            configuration.radio_frequency_hz,
+            configuration.radio_tx_power_dbm,
+            configuration.radio_spreading_factor,
+            configuration.radio_bandwidth_hz,
+            record_json,
+            source_packet_id,
+        ],
+    )?;
+    let id = connection.last_insert_rowid();
+    for step in &configuration.heater_steps {
+        connection.execute(
+            "INSERT INTO v2_heater_profile_steps (
+                configuration_id, step_index, target_temperature_celsius,
+                configured_duration_us, repetition_multiplier,
+                programmed_heater_current, programmed_heater_resistance,
+                programmed_gas_wait
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![
+                id,
+                step.step_index,
+                step.target_temperature_celsius,
+                step.configured_duration_us,
+                step.repetition_multiplier,
+                step.readback_heater_current,
+                step.programmed_heater_resistance,
+                step.programmed_gas_wait,
+            ],
+        )?;
+    }
+    Ok(StoredRecord {
+        id,
+        received_at_unix_ms: received_at,
+    })
+}
+
+fn insert_device_health_at(
+    connection: &Connection,
+    health: &DeviceHealth,
+    record_json: &str,
+    received_at: i64,
+    source_packet_id: Option<i64>,
+) -> Result<StoredRecord, StorageError> {
+    connection.execute(
+        "INSERT INTO v2_device_health (
+            received_at_unix_ms, node_id, boot_id, scan_sequence,
+            uptime_ms, config_id, common_flags, reset_cause_flags,
+            health_flags, reset_cause_raw, successful_sensor_scans,
+            failed_sensor_scans, incomplete_profiles, i2c_errors,
+            radio_tx_errors, dropped_profiles, dropped_fragments,
+            overwritten_fields, current_sample_interval_ms,
+            firmware_version, profile_id, profile_version,
+            last_sensor_error, last_radio_error,
+            calibrated_mcu_temperature_centi_celsius,
+            calibrated_vdd_millivolt, record_json, source_packet_id
+         ) VALUES (
+            ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13,
+            ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24,
+            ?25, ?26, ?27, ?28
+         )",
+        params![
+            received_at,
+            hex_u64(health.identity.node_id),
+            hex_u64(health.identity.boot_id),
+            health.identity.scan_sequence,
+            hex_u64(health.identity.uptime_ms),
+            hex_u64(health.identity.config_id),
+            health.identity.common_flags,
+            health.identity.reset_cause_flags,
+            health.health_flags,
+            health.reset_cause_raw,
+            health.successful_sensor_scans,
+            health.failed_sensor_scans,
+            health.incomplete_profiles,
+            health.i2c_errors,
+            health.radio_tx_errors,
+            health.dropped_profiles,
+            health.dropped_fragments,
+            health.overwritten_fields,
+            health.current_sample_interval_ms,
+            semver_text(health.firmware_version),
+            health.profile_id,
+            health.profile_version,
+            health.last_sensor_error,
+            health.last_radio_error,
+            health.calibrated_mcu_temperature_centi_celsius,
+            health.calibrated_vdd_millivolt,
+            record_json,
+            source_packet_id,
+        ],
+    )?;
+    Ok(StoredRecord {
+        id: connection.last_insert_rowid(),
+        received_at_unix_ms: received_at,
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1283,6 +2011,10 @@ pub enum StorageError {
     ProfileWithoutFragments,
     InvalidPendingReplayLimit,
     PendingReplayLimitExceeded { pending: i64, limit: usize },
+    InvalidIncompleteReplayLimit,
+    IncompleteReplayLimitExceeded { fragments: i64, limit: usize },
+    CorruptIncompleteProfile,
+    CorruptHexIdentity { field: &'static str },
     MigrationForeignKeyViolations { count: i64 },
     UnsupportedSchemaVersion { found: i64 },
 }
@@ -1309,6 +2041,22 @@ impl fmt::Display for StorageError {
                 formatter,
                 "{pending} pending profile fragments exceed startup replay limit {limit}"
             ),
+            Self::InvalidIncompleteReplayLimit => {
+                formatter.write_str("incomplete-profile replay limit must be positive")
+            }
+            Self::IncompleteReplayLimitExceeded { fragments, limit } => write!(
+                formatter,
+                "{fragments} persisted incomplete-profile fragments exceed replay limit {limit}"
+            ),
+            Self::CorruptIncompleteProfile => {
+                formatter.write_str("persisted incomplete profile has no grouping row")
+            }
+            Self::CorruptHexIdentity { field } => {
+                write!(
+                    formatter,
+                    "persisted profile has an invalid hexadecimal {field}"
+                )
+            }
             Self::MigrationForeignKeyViolations { count } => write!(
                 formatter,
                 "schema migration left {count} foreign-key violation(s)"
@@ -1334,6 +2082,10 @@ impl std::error::Error for StorageError {
             | Self::ProfileWithoutFragments
             | Self::InvalidPendingReplayLimit
             | Self::PendingReplayLimitExceeded { .. }
+            | Self::InvalidIncompleteReplayLimit
+            | Self::IncompleteReplayLimitExceeded { .. }
+            | Self::CorruptIncompleteProfile
+            | Self::CorruptHexIdentity { .. }
             | Self::MigrationForeignKeyViolations { .. }
             | Self::UnsupportedSchemaVersion { .. } => None,
         }
@@ -1457,16 +2209,13 @@ mod tests {
         else {
             unreachable!()
         };
-        let packet = store
-            .archive_v2_packet(
+        store
+            .insert_received_device_health(
                 encoded.as_slice(),
                 radio(),
                 header,
-                V2PacketKind::DeviceHealth,
+                &device_health(header, health),
             )
-            .unwrap();
-        store
-            .insert_device_health(&device_health(header, health), Some(packet.id))
             .unwrap();
 
         let row: (String, String, i64, i64) = store
@@ -1489,14 +2238,112 @@ mod tests {
         assert_eq!(foreign_key_violations, 0);
     }
 
+    #[test]
+    fn config_and_health_archive_roll_back_with_logical_insert_failure() {
+        let mut store = TelemetryStore::open_in_memory().unwrap();
+        let config_payload = parse_payload_hex(CONFIG_V2).unwrap();
+        let vesta_protocol::v2::DecodedFrame::DeviceConfig { header, config } =
+            vesta_protocol::v2::decode(&config_payload).unwrap()
+        else {
+            unreachable!()
+        };
+        store
+            .connection
+            .execute_batch(
+                "CREATE TRIGGER reject_configuration
+                 BEFORE INSERT ON v2_device_configurations
+                 BEGIN SELECT RAISE(ABORT, 'injected config failure'); END;",
+            )
+            .unwrap();
+        assert!(
+            store
+                .insert_received_device_configuration(
+                    &config_payload,
+                    radio(),
+                    header,
+                    &device_configuration(header, config),
+                )
+                .is_err()
+        );
+        let archived_after_config: i64 = store
+            .connection
+            .query_row("SELECT count(*) FROM radio_packets", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(archived_after_config, 0);
+        store
+            .connection
+            .execute_batch("DROP TRIGGER reject_configuration;")
+            .unwrap();
+
+        let common = vesta_protocol::v2::Common::boot_id_unavailable(1, 7, 12, 0, 0);
+        let encoded = vesta_protocol::v2::encode_device_health(
+            common,
+            &vesta_protocol::v2::DeviceHealth {
+                flags: vesta_protocol::v2::HEALTH_FLAG_BOOT_ID_UNAVAILABLE,
+                reset_cause_raw: 0,
+                successful_sensor_scans: 0,
+                failed_sensor_scans: 1,
+                incomplete_profiles: 0,
+                i2c_errors: 1,
+                radio_tx_errors: 0,
+                dropped_profiles: 0,
+                dropped_fragments: 0,
+                overwritten_fields: 0,
+                current_sample_interval_ms: 180_000,
+                firmware_version: [2, 0, 0],
+                profile_id: 0,
+                profile_version: 0,
+                last_sensor_error: 1,
+                last_radio_error: 0,
+                calibrated_mcu_temperature_centi_celsius: None,
+                calibrated_vdd_millivolt: None,
+            },
+        )
+        .unwrap();
+        let vesta_protocol::v2::DecodedFrame::DeviceHealth { header, health } =
+            vesta_protocol::v2::decode(encoded.as_slice()).unwrap()
+        else {
+            unreachable!()
+        };
+        store
+            .connection
+            .execute_batch(
+                "CREATE TRIGGER reject_health
+                 BEFORE INSERT ON v2_device_health
+                 BEGIN SELECT RAISE(ABORT, 'injected health failure'); END;",
+            )
+            .unwrap();
+        assert!(
+            store
+                .insert_received_device_health(
+                    encoded.as_slice(),
+                    radio(),
+                    header,
+                    &device_health(header, health),
+                )
+                .is_err()
+        );
+        let counts: (i64, i64, i64) = store
+            .connection
+            .query_row(
+                "SELECT (SELECT count(*) FROM radio_packets),
+                        (SELECT count(*) FROM v2_packet_decodes),
+                        (SELECT count(*) FROM v2_device_health)",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(counts, (0, 0, 0));
+    }
+
     fn protocol_step(index: u8) -> vesta_protocol::v2::ProfileStep {
         vesta_protocol::v2::ProfileStep {
             step_index: index,
             gas_index: index,
             measurement_index: index,
             status: 0xb0,
-            raw_measurement_status: 0x80,
-            raw_gas_status: 0x30,
+            raw_measurement_status: 0x80 | index,
+            raw_gas_status: 0x35,
             target_temperature_celsius: 200 + u16::from(index),
             configured_duration_us: 138_898,
             offset_us: u32::from(index) * 138_898,
@@ -1566,22 +2413,19 @@ mod tests {
         else {
             unreachable!()
         };
-        let packet = store
-            .archive_v2_packet(&config_payload, radio(), header, V2PacketKind::DeviceConfig)
+        let configuration = device_configuration(header, config);
+        let stored = store
+            .insert_received_device_configuration(&config_payload, radio(), header, &configuration)
             .unwrap();
         let disposition: String = store
             .connection
             .query_row(
                 "SELECT disposition FROM radio_packets WHERE id = ?1",
-                [packet.id],
+                [stored.packet.id],
                 |row| row.get(0),
             )
             .unwrap();
         assert_eq!(disposition, "v2");
-        let configuration = device_configuration(header, config);
-        store
-            .insert_device_configuration(&configuration, Some(packet.id))
-            .unwrap();
         let config_row: (String, String, i64, i64) = store
             .connection
             .query_row(
@@ -1613,12 +2457,7 @@ mod tests {
                 unreachable!()
             };
             let archived = store
-                .archive_v2_packet(
-                    payload,
-                    radio(),
-                    fragment.header,
-                    V2PacketKind::ProfileFragment,
-                )
+                .archive_v2_profile_fragment(payload, radio(), fragment.header)
                 .unwrap();
             let result = reassembler
                 .ingest(
@@ -1667,7 +2506,7 @@ mod tests {
                 1,
                 10,
                 4,
-                0x80,
+                0x89,
             )
         );
     }
@@ -1686,12 +2525,7 @@ mod tests {
                 unreachable!()
             };
             let packet = store
-                .archive_v2_packet(
-                    frame.as_slice(),
-                    radio(),
-                    fragment.header,
-                    V2PacketKind::ProfileFragment,
-                )
+                .archive_v2_profile_fragment(frame.as_slice(), radio(), fragment.header)
                 .unwrap();
             let result = reassembler
                 .ingest(
@@ -1718,17 +2552,12 @@ mod tests {
             unreachable!()
         };
         let duplicate_packet = store
-            .archive_v2_packet(
-                duplicate_payload,
-                radio(),
-                duplicate.header,
-                V2PacketKind::ProfileFragment,
-            )
+            .archive_v2_profile_fragment(duplicate_payload, radio(), duplicate.header)
             .unwrap();
         let key = ProfileKey::from(&duplicate.header);
         assert_eq!(
             store
-                .reconcile_completed_profile_fragment(
+                .reconcile_persisted_profile_fragment(
                     key,
                     duplicate_packet.id,
                     0,
@@ -1747,16 +2576,11 @@ mod tests {
             unreachable!()
         };
         let conflict_packet = store
-            .archive_v2_packet(
-                &conflict_payload,
-                radio(),
-                conflict.header,
-                V2PacketKind::ProfileFragment,
-            )
+            .archive_v2_profile_fragment(&conflict_payload, radio(), conflict.header)
             .unwrap();
         assert_eq!(
             store
-                .reconcile_completed_profile_fragment(
+                .reconcile_persisted_profile_fragment(
                     ProfileKey::from(&conflict.header),
                     conflict_packet.id,
                     0,
@@ -1805,12 +2629,7 @@ mod tests {
             unreachable!()
         };
         let archived = store
-            .archive_v2_packet(
-                payload,
-                radio(),
-                fragment.header,
-                V2PacketKind::ProfileFragment,
-            )
+            .archive_v2_profile_fragment(payload, radio(), fragment.header)
             .unwrap();
         let mut reassembler = ProfileReassembler::default();
         reassembler
@@ -1855,12 +2674,7 @@ mod tests {
             };
             archived.push(
                 store
-                    .archive_v2_packet(
-                        payload,
-                        radio(),
-                        fragment.header,
-                        V2PacketKind::ProfileFragment,
-                    )
+                    .archive_v2_profile_fragment(payload, radio(), fragment.header)
                     .unwrap(),
             );
         }
@@ -1955,19 +2769,24 @@ mod tests {
         assert_eq!(foreign_key_violations, 0);
 
         let config_payload = parse_payload_hex(CONFIG_V2).unwrap();
-        let vesta_protocol::v2::DecodedFrame::DeviceConfig { header, .. } =
+        let vesta_protocol::v2::DecodedFrame::DeviceConfig { header, config } =
             vesta_protocol::v2::decode(&config_payload).unwrap()
         else {
             unreachable!()
         };
-        let v2_packet = store
-            .archive_v2_packet(&config_payload, radio(), header, V2PacketKind::DeviceConfig)
+        let v2 = store
+            .insert_received_device_configuration(
+                &config_payload,
+                radio(),
+                header,
+                &device_configuration(header, config),
+            )
             .unwrap();
         let v2_disposition: String = store
             .connection
             .query_row(
                 "SELECT disposition FROM radio_packets WHERE id = ?1",
-                [v2_packet.id],
+                [v2.packet.id],
                 |row| row.get(0),
             )
             .unwrap();
