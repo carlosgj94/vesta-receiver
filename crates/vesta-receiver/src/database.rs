@@ -4,253 +4,323 @@ use std::fmt;
 use std::path::Path;
 use std::time::{Duration, SystemTime, SystemTimeError, UNIX_EPOCH};
 
-use rusqlite::{Connection, params};
+use rusqlite::{Connection, OptionalExtension, params};
+#[cfg(test)]
+use vesta_protocol::v2::FrameType;
+use vesta_protocol::v2::Header;
 use vesta_protocol::{TelemetryV1, VERSION};
 
 use crate::RadioMetadata;
-use crate::records::{DeviceConfiguration, DeviceHealth, ProfileScan, RecordError};
+use crate::reassembly::ReassembledProfile;
+use crate::records::{DeviceConfiguration, DeviceHealth, RecordError};
 
-const SCHEMA_VERSION: i64 = 2;
+const SCHEMA_VERSION: i64 = 3;
 const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 
 const SCHEMA_V1: &str = r"
 CREATE TABLE IF NOT EXISTS telemetry_readings (
-    id                          INTEGER PRIMARY KEY,
-    received_at_unix_ms         INTEGER NOT NULL CHECK (received_at_unix_ms >= 0),
-    protocol_version            INTEGER NOT NULL CHECK (protocol_version = 1),
-    node_id                     TEXT NOT NULL CHECK (
-                                    length(node_id) = 16
-                                    AND node_id NOT GLOB '*[^0-9a-f]*'
-                                ),
-    sequence                    INTEGER NOT NULL CHECK (sequence BETWEEN 0 AND 4294967295),
-
-    status_bits                 INTEGER NOT NULL CHECK (status_bits BETWEEN 0 AND 255),
-    status_new_data             INTEGER NOT NULL CHECK (status_new_data IN (0, 1)),
-    status_gas_valid            INTEGER NOT NULL CHECK (status_gas_valid IN (0, 1)),
-    status_heater_stable        INTEGER NOT NULL CHECK (status_heater_stable IN (0, 1)),
-    status_unknown_bits         INTEGER NOT NULL CHECK (status_unknown_bits BETWEEN 0 AND 255),
-
-    temperature_centi_celsius   INTEGER NOT NULL,
-    pressure_pascal             INTEGER NOT NULL CHECK (pressure_pascal >= 0),
-    humidity_milli_percent_rh   INTEGER NOT NULL CHECK (humidity_milli_percent_rh >= 0),
-    gas_resistance_ohm          INTEGER NOT NULL CHECK (gas_resistance_ohm >= 0),
-
-    raw_temperature_adc         INTEGER NOT NULL CHECK (raw_temperature_adc >= 0),
-    raw_pressure_adc            INTEGER NOT NULL CHECK (raw_pressure_adc >= 0),
-    raw_humidity_adc            INTEGER NOT NULL CHECK (raw_humidity_adc >= 0),
-    raw_gas_resistance_adc      INTEGER NOT NULL CHECK (raw_gas_resistance_adc >= 0),
-    raw_gas_range               INTEGER NOT NULL CHECK (raw_gas_range BETWEEN 0 AND 255),
-    raw_gas_index               INTEGER NOT NULL CHECK (raw_gas_index BETWEEN 0 AND 255),
-    raw_measurement_index       INTEGER NOT NULL CHECK (raw_measurement_index BETWEEN 0 AND 255),
-    raw_heater_resistance       INTEGER NOT NULL CHECK (raw_heater_resistance BETWEEN 0 AND 255),
-    raw_heater_current          INTEGER NOT NULL CHECK (raw_heater_current BETWEEN 0 AND 255),
-    raw_gas_wait                INTEGER NOT NULL CHECK (raw_gas_wait BETWEEN 0 AND 255),
-
-    packet_rssi_centi_dbm       INTEGER NOT NULL,
-    snr_centi_db                INTEGER NOT NULL,
-    signal_rssi_centi_dbm       INTEGER NOT NULL,
-    payload                     BLOB NOT NULL CHECK (length(payload) = 48)
+    id INTEGER PRIMARY KEY,
+    received_at_unix_ms INTEGER NOT NULL CHECK (received_at_unix_ms >= 0),
+    protocol_version INTEGER NOT NULL CHECK (protocol_version = 1),
+    node_id TEXT NOT NULL CHECK (length(node_id) = 16 AND node_id NOT GLOB '*[^0-9a-f]*'),
+    sequence INTEGER NOT NULL CHECK (sequence BETWEEN 0 AND 4294967295),
+    status_bits INTEGER NOT NULL CHECK (status_bits BETWEEN 0 AND 255),
+    status_new_data INTEGER NOT NULL CHECK (status_new_data IN (0, 1)),
+    status_gas_valid INTEGER NOT NULL CHECK (status_gas_valid IN (0, 1)),
+    status_heater_stable INTEGER NOT NULL CHECK (status_heater_stable IN (0, 1)),
+    status_unknown_bits INTEGER NOT NULL CHECK (status_unknown_bits BETWEEN 0 AND 255),
+    temperature_centi_celsius INTEGER NOT NULL,
+    pressure_pascal INTEGER NOT NULL CHECK (pressure_pascal >= 0),
+    humidity_milli_percent_rh INTEGER NOT NULL CHECK (humidity_milli_percent_rh >= 0),
+    gas_resistance_ohm INTEGER NOT NULL CHECK (gas_resistance_ohm >= 0),
+    raw_temperature_adc INTEGER NOT NULL CHECK (raw_temperature_adc >= 0),
+    raw_pressure_adc INTEGER NOT NULL CHECK (raw_pressure_adc >= 0),
+    raw_humidity_adc INTEGER NOT NULL CHECK (raw_humidity_adc >= 0),
+    raw_gas_resistance_adc INTEGER NOT NULL CHECK (raw_gas_resistance_adc >= 0),
+    raw_gas_range INTEGER NOT NULL CHECK (raw_gas_range BETWEEN 0 AND 255),
+    raw_gas_index INTEGER NOT NULL CHECK (raw_gas_index BETWEEN 0 AND 255),
+    raw_measurement_index INTEGER NOT NULL CHECK (raw_measurement_index BETWEEN 0 AND 255),
+    raw_heater_resistance INTEGER NOT NULL CHECK (raw_heater_resistance BETWEEN 0 AND 255),
+    raw_heater_current INTEGER NOT NULL CHECK (raw_heater_current BETWEEN 0 AND 255),
+    raw_gas_wait INTEGER NOT NULL CHECK (raw_gas_wait BETWEEN 0 AND 255),
+    packet_rssi_centi_dbm INTEGER NOT NULL,
+    snr_centi_db INTEGER NOT NULL,
+    signal_rssi_centi_dbm INTEGER NOT NULL,
+    payload BLOB NOT NULL CHECK (length(payload) = 48)
 ) STRICT;
-
 CREATE INDEX IF NOT EXISTS telemetry_readings_received_at
     ON telemetry_readings(received_at_unix_ms DESC);
 CREATE INDEX IF NOT EXISTS telemetry_readings_node_received_at
     ON telemetry_readings(node_id, received_at_unix_ms DESC);
 ";
 
-const SCHEMA_V2: &str = r"
+// Fresh schema-v3 databases classify successfully decoded v2 packets
+// explicitly. Existing schema-v2 databases are rebuilt by the migration below
+// because their CHECK constraint predates this disposition.
+const PACKET_ARCHIVE_SCHEMA_V3: &str = r"
 CREATE TABLE radio_packets (
-    id                          INTEGER PRIMARY KEY,
-    received_at_unix_ms         INTEGER NOT NULL CHECK (received_at_unix_ms >= 0),
-    packet_rssi_centi_dbm       INTEGER NOT NULL,
-    snr_centi_db                INTEGER NOT NULL,
-    signal_rssi_centi_dbm       INTEGER NOT NULL,
-    protocol_version            INTEGER CHECK (protocol_version BETWEEN 0 AND 255),
-    frame_type                  INTEGER CHECK (frame_type BETWEEN 0 AND 255),
-    disposition                 TEXT NOT NULL CHECK (
-                                    disposition IN ('v1', 'unsupported', 'invalid')
-                                ),
-    decode_error                TEXT,
-    payload                     BLOB NOT NULL CHECK (
-                                    length(payload) BETWEEN 0 AND 255
-                                )
+    id INTEGER PRIMARY KEY,
+    received_at_unix_ms INTEGER NOT NULL CHECK (received_at_unix_ms >= 0),
+    packet_rssi_centi_dbm INTEGER NOT NULL,
+    snr_centi_db INTEGER NOT NULL,
+    signal_rssi_centi_dbm INTEGER NOT NULL,
+    protocol_version INTEGER CHECK (protocol_version BETWEEN 0 AND 255),
+    frame_type INTEGER CHECK (frame_type BETWEEN 0 AND 255),
+    disposition TEXT NOT NULL CHECK (disposition IN ('v1', 'v2', 'unsupported', 'invalid')),
+    decode_error TEXT,
+    payload BLOB NOT NULL CHECK (length(payload) BETWEEN 0 AND 255)
 ) STRICT;
-
 CREATE INDEX radio_packets_received_at
     ON radio_packets(received_at_unix_ms DESC);
 CREATE INDEX radio_packets_version_received_at
     ON radio_packets(protocol_version, received_at_unix_ms DESC);
-
 ALTER TABLE telemetry_readings
     ADD COLUMN radio_packet_id INTEGER REFERENCES radio_packets(id);
 CREATE UNIQUE INDEX telemetry_readings_radio_packet
-    ON telemetry_readings(radio_packet_id)
-    WHERE radio_packet_id IS NOT NULL;
+    ON telemetry_readings(radio_packet_id) WHERE radio_packet_id IS NOT NULL;
+";
 
-CREATE TABLE device_configurations (
-    id                          INTEGER PRIMARY KEY,
-    received_at_unix_ms         INTEGER NOT NULL CHECK (received_at_unix_ms >= 0),
-    node_id                     TEXT NOT NULL CHECK (
-                                    length(node_id) = 16
-                                    AND node_id NOT GLOB '*[^0-9a-f]*'
-                                ),
-    boot_id                     INTEGER NOT NULL CHECK (boot_id BETWEEN 0 AND 4294967295),
-    sequence                    INTEGER NOT NULL CHECK (sequence BETWEEN 0 AND 4294967295),
-    uptime_ms                   INTEGER NOT NULL CHECK (uptime_ms >= 0),
-    firmware_version            TEXT NOT NULL,
-    reset_cause_bits            INTEGER NOT NULL CHECK (reset_cause_bits BETWEEN 0 AND 4294967295),
-    sensor_variant              INTEGER NOT NULL CHECK (sensor_variant BETWEEN 0 AND 255),
-    calibration_hash            TEXT CHECK (
-                                    calibration_hash IS NULL
-                                    OR (
-                                        length(calibration_hash) = 16
-                                        AND calibration_hash NOT GLOB '*[^0-9a-f]*'
-                                    )
-                                ),
-    humidity_oversampling       INTEGER NOT NULL CHECK (humidity_oversampling BETWEEN 0 AND 255),
-    temperature_oversampling    INTEGER NOT NULL CHECK (temperature_oversampling BETWEEN 0 AND 255),
-    pressure_oversampling       INTEGER NOT NULL CHECK (pressure_oversampling BETWEEN 0 AND 255),
-    iir_filter                  INTEGER NOT NULL CHECK (iir_filter BETWEEN 0 AND 255),
-    operation_mode              INTEGER NOT NULL CHECK (operation_mode BETWEEN 0 AND 255),
-    profile_id                  INTEGER NOT NULL CHECK (profile_id BETWEEN 0 AND 65535),
-    profile_revision            INTEGER NOT NULL CHECK (profile_revision BETWEEN 0 AND 65535),
-    scan_interval_ms            INTEGER NOT NULL CHECK (scan_interval_ms >= 0),
-    tx_power_centi_dbm          INTEGER NOT NULL,
-    radio_frequency_hz          INTEGER NOT NULL CHECK (radio_frequency_hz >= 0),
-    radio_spreading_factor      INTEGER NOT NULL CHECK (radio_spreading_factor BETWEEN 0 AND 255),
-    radio_bandwidth_hz          INTEGER NOT NULL CHECK (radio_bandwidth_hz >= 0),
-    radio_coding_rate           INTEGER NOT NULL CHECK (radio_coding_rate BETWEEN 0 AND 255),
-    source_packet_id            INTEGER REFERENCES radio_packets(id)
+// Rebuild only the constrained packet table. Foreign-key enforcement is
+// disabled around the transaction by `migrate_schema_two`; every primary key
+// and byte of archived data is copied explicitly, then checked after foreign
+// keys are restored. Legacy schema-v2 child tables keep referring to the final
+// `radio_packets` name.
+const RADIO_PACKETS_V2_TO_V3: &str = r"
+CREATE TABLE radio_packets_v3 (
+    id INTEGER PRIMARY KEY,
+    received_at_unix_ms INTEGER NOT NULL CHECK (received_at_unix_ms >= 0),
+    packet_rssi_centi_dbm INTEGER NOT NULL,
+    snr_centi_db INTEGER NOT NULL,
+    signal_rssi_centi_dbm INTEGER NOT NULL,
+    protocol_version INTEGER CHECK (protocol_version BETWEEN 0 AND 255),
+    frame_type INTEGER CHECK (frame_type BETWEEN 0 AND 255),
+    disposition TEXT NOT NULL CHECK (disposition IN ('v1', 'v2', 'unsupported', 'invalid')),
+    decode_error TEXT,
+    payload BLOB NOT NULL CHECK (length(payload) BETWEEN 0 AND 255)
 ) STRICT;
 
-CREATE INDEX device_configurations_node_received_at
-    ON device_configurations(node_id, received_at_unix_ms DESC);
+INSERT INTO radio_packets_v3 (
+    id, received_at_unix_ms, packet_rssi_centi_dbm, snr_centi_db,
+    signal_rssi_centi_dbm, protocol_version, frame_type, disposition,
+    decode_error, payload
+)
+SELECT
+    id, received_at_unix_ms, packet_rssi_centi_dbm, snr_centi_db,
+    signal_rssi_centi_dbm, protocol_version, frame_type, disposition,
+    decode_error, payload
+FROM radio_packets;
 
-CREATE TABLE heater_profile_steps (
-    configuration_id            INTEGER NOT NULL REFERENCES device_configurations(id) ON DELETE CASCADE,
-    step_index                  INTEGER NOT NULL CHECK (step_index BETWEEN 0 AND 9),
-    target_temperature_celsius  INTEGER NOT NULL CHECK (target_temperature_celsius BETWEEN 0 AND 65535),
-    duration_ms                 INTEGER NOT NULL CHECK (duration_ms BETWEEN 0 AND 65535),
+DROP TABLE radio_packets;
+ALTER TABLE radio_packets_v3 RENAME TO radio_packets;
+CREATE INDEX radio_packets_received_at
+    ON radio_packets(received_at_unix_ms DESC);
+CREATE INDEX radio_packets_version_received_at
+    ON radio_packets(protocol_version, received_at_unix_ms DESC);
+";
+
+const SCHEMA_V3: &str = r"
+CREATE TABLE IF NOT EXISTS v2_packet_decodes (
+    packet_id INTEGER PRIMARY KEY REFERENCES radio_packets(id) ON DELETE CASCADE,
+    frame_type INTEGER NOT NULL CHECK (frame_type IN (1, 2, 3)),
+    record_kind TEXT NOT NULL CHECK (record_kind IN ('device_config', 'profile_fragment', 'device_health')),
+    reassembly_status TEXT NOT NULL CHECK (reassembly_status IN ('not_applicable', 'pending', 'assembled', 'duplicate', 'conflict', 'incomplete')),
+    node_id TEXT NOT NULL CHECK (length(node_id) = 16 AND node_id NOT GLOB '*[^0-9a-f]*'),
+    boot_id TEXT NOT NULL CHECK (length(boot_id) = 16 AND boot_id NOT GLOB '*[^0-9a-f]*'),
+    scan_sequence INTEGER NOT NULL CHECK (scan_sequence BETWEEN 0 AND 4294967295),
+    uptime_ms TEXT NOT NULL CHECK (length(uptime_ms) = 16 AND uptime_ms NOT GLOB '*[^0-9a-f]*'),
+    config_id TEXT NOT NULL CHECK (length(config_id) = 16 AND config_id NOT GLOB '*[^0-9a-f]*'),
+    fragment_index INTEGER NOT NULL CHECK (fragment_index BETWEEN 0 AND 255),
+    fragment_count INTEGER NOT NULL CHECK (fragment_count BETWEEN 1 AND 255)
+) STRICT;
+
+CREATE TABLE IF NOT EXISTS v2_device_configurations (
+    id INTEGER PRIMARY KEY,
+    received_at_unix_ms INTEGER NOT NULL CHECK (received_at_unix_ms >= 0),
+    node_id TEXT NOT NULL,
+    boot_id TEXT NOT NULL,
+    scan_sequence INTEGER NOT NULL,
+    uptime_ms TEXT NOT NULL,
+    config_id TEXT NOT NULL,
+    common_flags INTEGER NOT NULL,
+    reset_cause_flags INTEGER NOT NULL,
+    repeated INTEGER NOT NULL CHECK (repeated IN (0, 1)),
+    firmware_version TEXT NOT NULL,
+    firmware_build_id TEXT NOT NULL,
+    sensor_chip_id INTEGER NOT NULL,
+    sensor_variant INTEGER NOT NULL,
+    calibration_hash_algorithm INTEGER NOT NULL,
+    calibration_hash TEXT NOT NULL,
+    profile_id INTEGER NOT NULL,
+    profile_version INTEGER NOT NULL,
+    expected_step_count INTEGER NOT NULL CHECK (expected_step_count BETWEEN 1 AND 10),
+    expected_profile_duration_us INTEGER NOT NULL,
+    scan_interval_ms INTEGER NOT NULL,
+    output_routes INTEGER NOT NULL,
+    radio_frequency_hz INTEGER NOT NULL,
+    radio_tx_power_dbm INTEGER NOT NULL,
+    radio_spreading_factor INTEGER NOT NULL,
+    radio_bandwidth_hz INTEGER NOT NULL,
+    record_json TEXT NOT NULL,
+    source_packet_id INTEGER REFERENCES radio_packets(id)
+) STRICT;
+CREATE INDEX IF NOT EXISTS v2_config_node_received
+    ON v2_device_configurations(node_id, received_at_unix_ms DESC);
+CREATE INDEX IF NOT EXISTS v2_config_identity
+    ON v2_device_configurations(node_id, config_id);
+
+CREATE TABLE IF NOT EXISTS v2_heater_profile_steps (
+    configuration_id INTEGER NOT NULL REFERENCES v2_device_configurations(id) ON DELETE CASCADE,
+    step_index INTEGER NOT NULL CHECK (step_index BETWEEN 0 AND 9),
+    target_temperature_celsius INTEGER NOT NULL,
+    configured_duration_us INTEGER NOT NULL,
+    repetition_multiplier INTEGER NOT NULL,
+    programmed_heater_current INTEGER NOT NULL,
+    programmed_heater_resistance INTEGER NOT NULL,
+    programmed_gas_wait INTEGER NOT NULL,
     PRIMARY KEY (configuration_id, step_index)
 ) STRICT;
 
-CREATE TABLE profile_scans (
-    id                          INTEGER PRIMARY KEY,
-    received_at_unix_ms         INTEGER NOT NULL CHECK (received_at_unix_ms >= 0),
-    node_id                     TEXT NOT NULL CHECK (
-                                    length(node_id) = 16
-                                    AND node_id NOT GLOB '*[^0-9a-f]*'
-                                ),
-    boot_id                     INTEGER NOT NULL CHECK (boot_id BETWEEN 0 AND 4294967295),
-    sequence                    INTEGER NOT NULL CHECK (sequence BETWEEN 0 AND 4294967295),
-    uptime_ms                   INTEGER NOT NULL CHECK (uptime_ms >= 0),
-    profile_id                  INTEGER NOT NULL CHECK (profile_id BETWEEN 0 AND 65535),
-    profile_revision            INTEGER NOT NULL CHECK (profile_revision BETWEEN 0 AND 65535),
-    expected_steps              INTEGER NOT NULL CHECK (expected_steps BETWEEN 1 AND 10),
-    observed_steps              INTEGER NOT NULL CHECK (observed_steps BETWEEN 0 AND 10),
-    reported_missing_steps      INTEGER NOT NULL CHECK (reported_missing_steps BETWEEN 0 AND 1023),
-    computed_missing_steps      INTEGER NOT NULL CHECK (computed_missing_steps BETWEEN 0 AND 1023),
-    duration_ms                 INTEGER NOT NULL CHECK (duration_ms >= 0),
-    collection_flags            INTEGER NOT NULL CHECK (collection_flags BETWEEN 0 AND 65535),
-    packet_rssi_centi_dbm       INTEGER NOT NULL,
-    snr_centi_db                INTEGER NOT NULL,
-    signal_rssi_centi_dbm       INTEGER NOT NULL
+CREATE TABLE IF NOT EXISTS v2_profile_scans (
+    id INTEGER PRIMARY KEY,
+    first_received_at_unix_ms INTEGER NOT NULL,
+    last_received_at_unix_ms INTEGER NOT NULL,
+    node_id TEXT NOT NULL,
+    boot_id TEXT NOT NULL,
+    scan_sequence INTEGER NOT NULL,
+    uptime_ms TEXT NOT NULL,
+    config_id TEXT NOT NULL,
+    common_flags INTEGER NOT NULL,
+    reset_cause_flags INTEGER NOT NULL,
+    profile_id INTEGER NOT NULL,
+    profile_version INTEGER NOT NULL,
+    expected_steps INTEGER NOT NULL CHECK (expected_steps BETWEEN 1 AND 10),
+    observed_unique_steps INTEGER NOT NULL,
+    observed_field_count INTEGER NOT NULL,
+    reported_missing_steps INTEGER NOT NULL,
+    duplicate_steps INTEGER NOT NULL,
+    duration_us INTEGER NOT NULL,
+    collection_flags INTEGER NOT NULL,
+    finish_reason INTEGER NOT NULL,
+    duplicate_count INTEGER NOT NULL,
+    overwritten_field_count INTEGER NOT NULL,
+    out_of_order_count INTEGER NOT NULL,
+    ambiguous_index_jump_count INTEGER NOT NULL,
+    invalid_gas_index_count INTEGER NOT NULL,
+    intermediate_field_count INTEGER NOT NULL,
+    profile_rollover_count INTEGER NOT NULL,
+    fields_after_rollover_count INTEGER NOT NULL,
+    poll_count INTEGER NOT NULL,
+    expected_fragment_count INTEGER NOT NULL,
+    received_fragment_bitmap INTEGER NOT NULL,
+    missing_fragment_bitmap INTEGER NOT NULL,
+    duplicate_fragment_count INTEGER NOT NULL,
+    conflicting_fragment_count INTEGER NOT NULL,
+    transport_complete INTEGER NOT NULL CHECK (transport_complete IN (0, 1)),
+    record_json TEXT NOT NULL
 ) STRICT;
+CREATE INDEX IF NOT EXISTS v2_profile_node_received
+    ON v2_profile_scans(node_id, last_received_at_unix_ms DESC);
+CREATE INDEX IF NOT EXISTS v2_profile_identity
+    ON v2_profile_scans(node_id, boot_id, scan_sequence, config_id);
 
-CREATE INDEX profile_scans_node_received_at
-    ON profile_scans(node_id, received_at_unix_ms DESC);
-CREATE INDEX profile_scans_identity
-    ON profile_scans(node_id, boot_id, sequence);
-
-CREATE TABLE profile_steps (
-    scan_id                     INTEGER NOT NULL REFERENCES profile_scans(id) ON DELETE CASCADE,
-    step_index                  INTEGER NOT NULL CHECK (step_index BETWEEN 0 AND 9),
-    gas_index                   INTEGER NOT NULL CHECK (gas_index BETWEEN 0 AND 255),
-    measurement_index           INTEGER NOT NULL CHECK (measurement_index BETWEEN 0 AND 255),
-    target_temperature_celsius  INTEGER NOT NULL CHECK (target_temperature_celsius BETWEEN 0 AND 65535),
-    heater_duration_ms          INTEGER NOT NULL CHECK (heater_duration_ms BETWEEN 0 AND 65535),
-    relative_offset_ms          INTEGER NOT NULL CHECK (relative_offset_ms >= 0),
-    status_bits                 INTEGER NOT NULL CHECK (status_bits BETWEEN 0 AND 255),
-    temperature_centi_celsius   INTEGER NOT NULL,
-    pressure_pascal             INTEGER NOT NULL CHECK (pressure_pascal >= 0),
-    humidity_milli_percent_rh   INTEGER NOT NULL CHECK (humidity_milli_percent_rh >= 0),
-    gas_resistance_ohm          INTEGER NOT NULL CHECK (gas_resistance_ohm >= 0),
-    raw_temperature_adc         INTEGER NOT NULL CHECK (raw_temperature_adc >= 0),
-    raw_pressure_adc            INTEGER NOT NULL CHECK (raw_pressure_adc >= 0),
-    raw_humidity_adc            INTEGER NOT NULL CHECK (raw_humidity_adc >= 0),
-    raw_gas_resistance_adc      INTEGER NOT NULL CHECK (raw_gas_resistance_adc >= 0),
-    raw_gas_range               INTEGER NOT NULL CHECK (raw_gas_range BETWEEN 0 AND 255),
-    raw_heater_resistance       INTEGER NOT NULL CHECK (raw_heater_resistance BETWEEN 0 AND 255),
-    raw_heater_current          INTEGER NOT NULL CHECK (raw_heater_current BETWEEN 0 AND 255),
-    raw_gas_wait                INTEGER NOT NULL CHECK (raw_gas_wait BETWEEN 0 AND 255),
+CREATE TABLE IF NOT EXISTS v2_profile_steps (
+    scan_id INTEGER NOT NULL REFERENCES v2_profile_scans(id) ON DELETE CASCADE,
+    step_index INTEGER NOT NULL CHECK (step_index BETWEEN 0 AND 9),
+    gas_index INTEGER NOT NULL,
+    measurement_index INTEGER NOT NULL,
+    status_bits INTEGER NOT NULL,
+    raw_measurement_status INTEGER NOT NULL,
+    raw_gas_status INTEGER NOT NULL,
+    target_temperature_celsius INTEGER NOT NULL,
+    configured_duration_us INTEGER NOT NULL,
+    relative_offset_us INTEGER NOT NULL,
+    temperature_centi_celsius INTEGER NOT NULL,
+    pressure_pascal INTEGER NOT NULL,
+    humidity_milli_percent_rh INTEGER NOT NULL,
+    gas_resistance_ohm INTEGER NOT NULL,
+    raw_temperature_adc INTEGER NOT NULL,
+    raw_pressure_adc INTEGER NOT NULL,
+    raw_humidity_adc INTEGER NOT NULL,
+    raw_gas_resistance_adc INTEGER NOT NULL,
+    raw_gas_range INTEGER NOT NULL,
+    repetition_multiplier INTEGER NOT NULL,
+    raw_heater_resistance INTEGER NOT NULL,
+    raw_heater_current INTEGER NOT NULL,
+    raw_gas_wait INTEGER NOT NULL,
     PRIMARY KEY (scan_id, step_index)
 ) STRICT;
 
-CREATE TABLE profile_scan_packets (
-    scan_id                     INTEGER NOT NULL REFERENCES profile_scans(id) ON DELETE CASCADE,
-    packet_id                   INTEGER NOT NULL REFERENCES radio_packets(id),
-    fragment_index              INTEGER NOT NULL CHECK (fragment_index BETWEEN 0 AND 255),
-    PRIMARY KEY (scan_id, packet_id),
-    UNIQUE (scan_id, fragment_index)
+CREATE TABLE IF NOT EXISTS v2_profile_fragments (
+    scan_id INTEGER NOT NULL REFERENCES v2_profile_scans(id) ON DELETE CASCADE,
+    packet_id INTEGER NOT NULL REFERENCES radio_packets(id),
+    fragment_index INTEGER NOT NULL,
+    received_at_unix_ms INTEGER NOT NULL,
+    packet_rssi_centi_dbm INTEGER NOT NULL,
+    snr_centi_db INTEGER NOT NULL,
+    signal_rssi_centi_dbm INTEGER NOT NULL,
+    PRIMARY KEY (scan_id, fragment_index),
+    UNIQUE (packet_id)
 ) STRICT;
 
-CREATE TABLE device_health (
-    id                          INTEGER PRIMARY KEY,
-    received_at_unix_ms         INTEGER NOT NULL CHECK (received_at_unix_ms >= 0),
-    node_id                     TEXT NOT NULL CHECK (
-                                    length(node_id) = 16
-                                    AND node_id NOT GLOB '*[^0-9a-f]*'
-                                ),
-    boot_id                     INTEGER NOT NULL CHECK (boot_id BETWEEN 0 AND 4294967295),
-    sequence                    INTEGER NOT NULL CHECK (sequence BETWEEN 0 AND 4294967295),
-    uptime_ms                   INTEGER NOT NULL CHECK (uptime_ms >= 0),
-    reset_cause_bits            INTEGER NOT NULL CHECK (reset_cause_bits BETWEEN 0 AND 4294967295),
-    successful_scans            INTEGER NOT NULL CHECK (successful_scans BETWEEN 0 AND 4294967295),
-    failed_scans                INTEGER NOT NULL CHECK (failed_scans BETWEEN 0 AND 4294967295),
-    incomplete_profiles         INTEGER NOT NULL CHECK (incomplete_profiles BETWEEN 0 AND 4294967295),
-    i2c_errors                  INTEGER NOT NULL CHECK (i2c_errors BETWEEN 0 AND 4294967295),
-    radio_errors                INTEGER NOT NULL CHECK (radio_errors BETWEEN 0 AND 4294967295),
-    dropped_records             INTEGER NOT NULL CHECK (dropped_records BETWEEN 0 AND 4294967295),
-    mcu_temperature_centi_celsius INTEGER,
-    vdd_millivolt               INTEGER CHECK (vdd_millivolt BETWEEN 0 AND 65535),
-    source_packet_id            INTEGER REFERENCES radio_packets(id)
+CREATE TABLE IF NOT EXISTS v2_device_health (
+    id INTEGER PRIMARY KEY,
+    received_at_unix_ms INTEGER NOT NULL,
+    node_id TEXT NOT NULL,
+    boot_id TEXT NOT NULL,
+    scan_sequence INTEGER NOT NULL,
+    uptime_ms TEXT NOT NULL,
+    config_id TEXT NOT NULL,
+    common_flags INTEGER NOT NULL,
+    reset_cause_flags INTEGER NOT NULL,
+    health_flags INTEGER NOT NULL,
+    reset_cause_raw INTEGER NOT NULL,
+    successful_sensor_scans INTEGER NOT NULL,
+    failed_sensor_scans INTEGER NOT NULL,
+    incomplete_profiles INTEGER NOT NULL,
+    i2c_errors INTEGER NOT NULL,
+    radio_tx_errors INTEGER NOT NULL,
+    dropped_profiles INTEGER NOT NULL,
+    dropped_fragments INTEGER NOT NULL,
+    overwritten_fields INTEGER NOT NULL,
+    current_sample_interval_ms INTEGER NOT NULL,
+    firmware_version TEXT NOT NULL,
+    profile_id INTEGER NOT NULL,
+    profile_version INTEGER NOT NULL,
+    last_sensor_error INTEGER NOT NULL,
+    last_radio_error INTEGER NOT NULL,
+    calibrated_mcu_temperature_centi_celsius INTEGER,
+    calibrated_vdd_millivolt INTEGER,
+    record_json TEXT NOT NULL,
+    source_packet_id INTEGER REFERENCES radio_packets(id)
 ) STRICT;
-
-CREATE INDEX device_health_node_received_at
-    ON device_health(node_id, received_at_unix_ms DESC);
+CREATE INDEX IF NOT EXISTS v2_health_node_received
+    ON v2_device_health(node_id, received_at_unix_ms DESC);
 ";
 
-/// `SQLite` store for every valid received observation.
+/// `SQLite` store for every PHY-valid packet and decoded logical record.
 pub struct TelemetryStore {
     connection: Connection,
 }
 
-/// Identity assigned to one durable database row.
+/// Identity assigned to one durable legacy reading.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct StoredReading {
-    /// `SQLite` row identifier.
     pub id: i64,
-    /// UTC receive time as milliseconds since the Unix epoch.
     pub received_at_unix_ms: i64,
-    /// Archived raw radio packet, when insertion came from the live receiver.
     pub radio_packet_id: Option<i64>,
 }
 
-/// Identity assigned to one archived PHY-valid radio packet.
+/// Identity assigned to one archived PHY-valid packet.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct StoredPacket {
-    /// `SQLite` row identifier.
     pub id: i64,
-    /// UTC receive time as milliseconds since the Unix epoch.
     pub received_at_unix_ms: i64,
 }
 
-/// Identity assigned to one protocol-independent logical record.
+/// Identity assigned to one logical protocol-v2 record.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct StoredRecord {
-    /// `SQLite` row identifier.
     pub id: i64,
-    /// UTC receive time as milliseconds since the Unix epoch.
     pub received_at_unix_ms: i64,
 }
 
@@ -259,6 +329,8 @@ pub struct StoredRecord {
 pub enum PacketDisposition {
     /// Successfully decoded protocol-v1 telemetry.
     LegacyV1,
+    /// Successfully decoded protocol-v2 telemetry.
+    ProtocolV2,
     /// PHY-valid payload awaiting or unsupported by an application decoder.
     Unsupported,
     /// Payload recognized as Vesta data but rejected by its decoder.
@@ -269,23 +341,66 @@ impl PacketDisposition {
     const fn database_value(self) -> &'static str {
         match self {
             Self::LegacyV1 => "v1",
+            Self::ProtocolV2 => "v2",
             Self::Unsupported => "unsupported",
             Self::Invalid => "invalid",
         }
     }
 }
 
+/// Exact kind of a successfully decoded protocol-v2 frame.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum V2PacketKind {
+    DeviceConfig,
+    ProfileFragment,
+    DeviceHealth,
+}
+
+impl V2PacketKind {
+    const fn database_value(self) -> &'static str {
+        match self {
+            Self::DeviceConfig => "device_config",
+            Self::ProfileFragment => "profile_fragment",
+            Self::DeviceHealth => "device_health",
+        }
+    }
+
+    const fn initial_reassembly_status(self) -> &'static str {
+        match self {
+            Self::ProfileFragment => "pending",
+            Self::DeviceConfig | Self::DeviceHealth => "not_applicable",
+        }
+    }
+}
+
+/// Receiver-side state for one decoded v2 profile-fragment packet.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum FragmentStorageStatus {
+    Pending,
+    Assembled,
+    Duplicate,
+    Conflict,
+    Incomplete,
+}
+
+impl FragmentStorageStatus {
+    const fn database_value(self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::Assembled => "assembled",
+            Self::Duplicate => "duplicate",
+            Self::Conflict => "conflict",
+            Self::Incomplete => "incomplete",
+        }
+    }
+}
+
 impl TelemetryStore {
-    /// Open or create a telemetry database and apply the current schema.
-    ///
-    /// Parent directories are created when needed. Existing databases with a
-    /// newer or otherwise unsupported schema version are rejected rather than
-    /// modified.
+    /// Open or create a database and apply non-destructive migrations.
     ///
     /// # Errors
     ///
-    /// Returns an error if the directory or database cannot be opened, `SQLite`
-    /// initialization fails, or the schema version is unsupported.
+    /// Returns an error for filesystem, `SQLite`, or unsupported-schema failures.
     pub fn open(path: impl AsRef<Path>) -> Result<Self, StorageError> {
         let path = path.as_ref();
         if let Some(parent) = path
@@ -294,100 +409,82 @@ impl TelemetryStore {
         {
             std::fs::create_dir_all(parent)?;
         }
-
-        let connection = Connection::open(path)?;
-        Self::initialize(connection)
+        Self::initialize(Connection::open(path)?)
     }
 
-    /// Insert one valid Vesta frame and its exact raw payload atomically.
-    ///
-    /// A repeated node/sequence pair is retained as another observation. The
-    /// sequence is a wrapping device counter and therefore is not a durable
-    /// database identity.
+    fn initialize(mut connection: Connection) -> Result<Self, StorageError> {
+        connection.busy_timeout(SQLITE_BUSY_TIMEOUT)?;
+        connection.execute_batch(
+            "PRAGMA journal_mode = WAL; PRAGMA synchronous = FULL; PRAGMA foreign_keys = ON;",
+        )?;
+        let version = connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
+        match version {
+            0 => {
+                let transaction = connection.transaction()?;
+                transaction.execute_batch(SCHEMA_V1)?;
+                transaction.execute_batch(PACKET_ARCHIVE_SCHEMA_V3)?;
+                transaction.execute_batch(SCHEMA_V3)?;
+                transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+                transaction.commit()?;
+            }
+            1 => {
+                let transaction = connection.transaction()?;
+                transaction.execute_batch(PACKET_ARCHIVE_SCHEMA_V3)?;
+                transaction.execute_batch(SCHEMA_V3)?;
+                transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+                transaction.commit()?;
+            }
+            2 => {
+                migrate_schema_two(&mut connection)?;
+            }
+            SCHEMA_VERSION => {}
+            found => return Err(StorageError::UnsupportedSchemaVersion { found }),
+        }
+        Ok(Self { connection })
+    }
+
+    /// Insert one valid v1 observation without a packet-archive link.
     ///
     /// # Errors
     ///
-    /// Returns an error if the system clock predates the Unix epoch, the
-    /// timestamp cannot fit `SQLite`'s signed integer, or the insert fails.
+    /// Returns an error for timestamp or `SQLite` failures.
     pub fn insert(
         &self,
         frame: &TelemetryV1,
         payload: &[u8],
         radio: RadioMetadata,
     ) -> Result<StoredReading, StorageError> {
-        let elapsed = SystemTime::now().duration_since(UNIX_EPOCH)?;
-        let received_at_unix_ms =
-            i64::try_from(elapsed.as_millis()).map_err(|_| StorageError::TimestampOutOfRange)?;
-        self.insert_at(frame, payload, radio, received_at_unix_ms)
-    }
-
-    fn initialize(mut connection: Connection) -> Result<Self, StorageError> {
-        connection.busy_timeout(SQLITE_BUSY_TIMEOUT)?;
-        connection.execute_batch(
-            "PRAGMA journal_mode = WAL;
-             PRAGMA synchronous = FULL;
-             PRAGMA foreign_keys = ON;",
-        )?;
-
-        let version = connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
-        match version {
-            0 => {
-                let transaction = connection.transaction()?;
-                transaction.execute_batch(SCHEMA_V1)?;
-                transaction.execute_batch(SCHEMA_V2)?;
-                transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
-                transaction.commit()?;
-            }
-            1 => {
-                let transaction = connection.transaction()?;
-                transaction.execute_batch(SCHEMA_V2)?;
-                transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
-                transaction.commit()?;
-            }
-            SCHEMA_VERSION => {}
-            found => return Err(StorageError::UnsupportedSchemaVersion { found }),
-        }
-
-        Ok(Self { connection })
-    }
-
-    fn insert_at(
-        &self,
-        frame: &TelemetryV1,
-        payload: &[u8],
-        radio: RadioMetadata,
-        received_at_unix_ms: i64,
-    ) -> Result<StoredReading, StorageError> {
         insert_reading_at(
             &self.connection,
             frame,
             payload,
             radio,
-            received_at_unix_ms,
+            current_unix_ms()?,
             None,
         )
     }
 
-    /// Atomically archive one PHY-valid packet and its decoded v1 reading.
+    /// Atomically archive and store one decoded v1 packet.
     ///
     /// # Errors
     ///
-    /// Returns an error if timestamp generation, packet archival, telemetry
-    /// insertion, or transaction commit fails.
+    /// Returns an error for timestamp or transactional failures.
     pub fn insert_received_v1(
         &mut self,
         frame: &TelemetryV1,
         payload: &[u8],
         radio: RadioMetadata,
     ) -> Result<StoredReading, StorageError> {
-        let received_at_unix_ms = current_unix_ms()?;
+        let received_at = current_unix_ms()?;
         let transaction = self.connection.transaction()?;
         let packet = insert_packet_at(
             &transaction,
             payload,
             radio,
-            received_at_unix_ms,
+            received_at,
             PacketDisposition::LegacyV1,
+            Some(VERSION),
+            None,
             None,
         )?;
         let reading = insert_reading_at(
@@ -395,21 +492,18 @@ impl TelemetryStore {
             frame,
             payload,
             radio,
-            received_at_unix_ms,
+            received_at,
             Some(packet.id),
         )?;
         transaction.commit()?;
         Ok(reading)
     }
 
-    /// Archive a PHY-valid packet that could not be decoded yet.
-    ///
-    /// This is the compatibility boundary for future protocol versions: raw
-    /// packets remain recoverable even before their exact decoder is merged.
+    /// Archive a PHY-valid unsupported or malformed application payload.
     ///
     /// # Errors
     ///
-    /// Returns an error if the timestamp or `SQLite` insert fails.
+    /// Returns an error for timestamp or `SQLite` failures.
     pub fn archive_packet(
         &self,
         payload: &[u8],
@@ -417,171 +511,290 @@ impl TelemetryStore {
         disposition: PacketDisposition,
         decode_error: Option<&str>,
     ) -> Result<StoredPacket, StorageError> {
+        let version = payload
+            .starts_with(b"VS")
+            .then(|| payload.get(2).copied())
+            .flatten();
         insert_packet_at(
             &self.connection,
             payload,
             radio,
             current_unix_ms()?,
             disposition,
+            version,
+            payload.get(3).copied(),
             decode_error,
         )
     }
 
-    /// Store one decoded device-configuration record and its heater steps.
+    /// Archive a validated v2 frame and attach exact common-header metadata.
     ///
     /// # Errors
     ///
-    /// Returns an error for structurally invalid configuration or a failed
-    /// transactional insert.
+    /// Returns an error if packet archival or metadata insertion fails.
+    pub fn archive_v2_packet(
+        &mut self,
+        payload: &[u8],
+        radio: RadioMetadata,
+        header: Header,
+        kind: V2PacketKind,
+    ) -> Result<StoredPacket, StorageError> {
+        let received_at = current_unix_ms()?;
+        let transaction = self.connection.transaction()?;
+        let packet = insert_packet_at(
+            &transaction,
+            payload,
+            radio,
+            received_at,
+            PacketDisposition::ProtocolV2,
+            Some(vesta_protocol::v2::VERSION_V2),
+            Some(header.frame_type as u8),
+            None,
+        )?;
+        transaction.execute(
+            "INSERT INTO v2_packet_decodes (
+                packet_id, frame_type, record_kind, reassembly_status,
+                node_id, boot_id, scan_sequence, uptime_ms, config_id,
+                fragment_index, fragment_count
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+            params![
+                packet.id,
+                header.frame_type as u8,
+                kind.database_value(),
+                kind.initial_reassembly_status(),
+                hex_u64(header.common.node_id),
+                hex_u64(header.common.boot_id),
+                header.common.scan_sequence,
+                hex_u64(header.common.uptime_ms),
+                hex_u64(header.common.config_id),
+                header.fragment_index,
+                header.fragment_count,
+            ],
+        )?;
+        transaction.commit()?;
+        Ok(packet)
+    }
+
+    /// Update receiver-side reassembly state for an archived fragment.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the packet does not identify a profile fragment or
+    /// the update fails.
+    pub fn mark_fragment_status(
+        &self,
+        packet_id: i64,
+        status: FragmentStorageStatus,
+    ) -> Result<(), StorageError> {
+        let changed = self.connection.execute(
+            "UPDATE v2_packet_decodes SET reassembly_status = ?1
+             WHERE packet_id = ?2 AND record_kind = 'profile_fragment'",
+            params![status.database_value(), packet_id],
+        )?;
+        if changed == 1 {
+            Ok(())
+        } else {
+            Err(StorageError::MissingV2Packet { packet_id })
+        }
+    }
+
+    /// Store one exact v2 configuration and its ordered heater descriptors.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for invalid structure, JSON, timestamps, or `SQLite`.
     pub fn insert_device_configuration(
         &mut self,
         configuration: &DeviceConfiguration,
         source_packet_id: Option<i64>,
     ) -> Result<StoredRecord, StorageError> {
         configuration.validate()?;
-        let received_at_unix_ms = current_unix_ms()?;
+        let received_at = self.packet_or_current_time(source_packet_id)?;
+        let record_json = serde_json::to_string(configuration)?;
         let transaction = self.connection.transaction()?;
         transaction.execute(
-            "INSERT INTO device_configurations (
-                received_at_unix_ms, node_id, boot_id, sequence, uptime_ms,
-                firmware_version, reset_cause_bits, sensor_variant,
-                calibration_hash, humidity_oversampling,
-                temperature_oversampling, pressure_oversampling, iir_filter,
-                operation_mode, profile_id, profile_revision,
-                scan_interval_ms, tx_power_centi_dbm, radio_frequency_hz,
-                radio_spreading_factor, radio_bandwidth_hz,
-                radio_coding_rate, source_packet_id
+            "INSERT INTO v2_device_configurations (
+                received_at_unix_ms, node_id, boot_id, scan_sequence, uptime_ms,
+                config_id, common_flags, reset_cause_flags, repeated,
+                firmware_version, firmware_build_id, sensor_chip_id,
+                sensor_variant, calibration_hash_algorithm, calibration_hash,
+                profile_id, profile_version, expected_step_count,
+                expected_profile_duration_us, scan_interval_ms, output_routes,
+                radio_frequency_hz, radio_tx_power_dbm,
+                radio_spreading_factor, radio_bandwidth_hz, record_json,
+                source_packet_id
              ) VALUES (
-                ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12,
-                ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23
+                ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13,
+                ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24,
+                ?25, ?26, ?27
              )",
             params![
-                received_at_unix_ms,
-                node_id_text(configuration.identity.node_id),
-                configuration.identity.boot_id,
-                configuration.identity.sequence,
-                sqlite_u64(configuration.identity.uptime_ms, "uptime_ms")?,
-                configuration.firmware_version.as_str(),
-                configuration.reset_cause_bits,
+                received_at,
+                hex_u64(configuration.identity.node_id),
+                hex_u64(configuration.identity.boot_id),
+                configuration.identity.scan_sequence,
+                hex_u64(configuration.identity.uptime_ms),
+                hex_u64(configuration.identity.config_id),
+                configuration.identity.common_flags,
+                configuration.identity.reset_cause_flags,
+                configuration.repeated,
+                semver_text(configuration.firmware_version),
+                hex_u64(configuration.firmware_build_id),
+                configuration.sensor_chip_id,
                 configuration.sensor_variant,
-                configuration
-                    .calibration_hash
-                    .map(|hash| format!("{hash:016x}")),
-                configuration.humidity_oversampling,
-                configuration.temperature_oversampling,
-                configuration.pressure_oversampling,
-                configuration.iir_filter,
-                configuration.operation_mode,
+                configuration.calibration_hash_algorithm,
+                hex_u64(configuration.calibration_hash),
                 configuration.profile_id,
-                configuration.profile_revision,
+                configuration.profile_version,
+                configuration.expected_step_count,
+                configuration.expected_profile_duration_us,
                 configuration.scan_interval_ms,
-                configuration.tx_power_centi_dbm,
+                configuration.output_routes,
                 configuration.radio_frequency_hz,
+                configuration.radio_tx_power_dbm,
                 configuration.radio_spreading_factor,
                 configuration.radio_bandwidth_hz,
-                configuration.radio_coding_rate,
+                record_json,
                 source_packet_id,
             ],
         )?;
         let id = transaction.last_insert_rowid();
         for step in &configuration.heater_steps {
             transaction.execute(
-                "INSERT INTO heater_profile_steps (
-                    configuration_id, step_index,
-                    target_temperature_celsius, duration_ms
-                 ) VALUES (?1, ?2, ?3, ?4)",
+                "INSERT INTO v2_heater_profile_steps (
+                    configuration_id, step_index, target_temperature_celsius,
+                    configured_duration_us, repetition_multiplier,
+                    programmed_heater_current, programmed_heater_resistance,
+                    programmed_gas_wait
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
                 params![
                     id,
                     step.step_index,
                     step.target_temperature_celsius,
-                    step.duration_ms,
+                    step.configured_duration_us,
+                    step.repetition_multiplier,
+                    step.programmed_heater_current,
+                    step.programmed_heater_resistance,
+                    step.programmed_gas_wait,
                 ],
             )?;
         }
         transaction.commit()?;
         Ok(StoredRecord {
             id,
-            received_at_unix_ms,
+            received_at_unix_ms: received_at,
         })
     }
 
-    /// Store one decoded heater-profile scan and all recovered steps.
+    /// Store a complete or transport-incomplete reassembled profile.
     ///
-    /// Fragment packet IDs are optional until the v2 reassembler exists, but
-    /// when provided their indices are persisted for byte-level audit.
+    /// Every unique source fragment retains its own receiver timestamp and
+    /// RSSI/SNR values; no synthetic scan-level link metric is created.
     ///
     /// # Errors
     ///
-    /// Returns an error for inconsistent profile structure, integer overflow,
-    /// missing packet references, or a failed transactional insert.
+    /// Returns an error for invalid structure, absent sources, JSON, or `SQLite`.
+    #[allow(clippy::too_many_lines)]
     pub fn insert_profile_scan(
         &mut self,
-        scan: &ProfileScan,
-        radio: RadioMetadata,
-        source_fragments: &[(i64, u8)],
+        profile: &ReassembledProfile,
     ) -> Result<StoredRecord, StorageError> {
-        scan.validate()?;
-        let observed_steps =
-            i64::try_from(scan.steps.len()).map_err(|_| StorageError::IntegerOutOfRange {
-                field: "observed_steps",
-            })?;
-        let received_at_unix_ms = current_unix_ms()?;
+        profile.scan.validate()?;
+        let first_received = profile
+            .first_received_at_unix_ms()
+            .ok_or(StorageError::ProfileWithoutFragments)?;
+        let last_received = profile
+            .last_received_at_unix_ms()
+            .ok_or(StorageError::ProfileWithoutFragments)?;
+        let scan = &profile.scan;
+        let record_json = serde_json::to_string(scan)?;
         let transaction = self.connection.transaction()?;
         transaction.execute(
-            "INSERT INTO profile_scans (
-                received_at_unix_ms, node_id, boot_id, sequence, uptime_ms,
-                profile_id, profile_revision, expected_steps, observed_steps,
-                reported_missing_steps, computed_missing_steps, duration_ms,
-                collection_flags, packet_rssi_centi_dbm, snr_centi_db,
-                signal_rssi_centi_dbm
+            "INSERT INTO v2_profile_scans (
+                first_received_at_unix_ms, last_received_at_unix_ms, node_id,
+                boot_id, scan_sequence, uptime_ms, config_id, common_flags,
+                reset_cause_flags, profile_id, profile_version, expected_steps,
+                observed_unique_steps, observed_field_count,
+                reported_missing_steps, duplicate_steps, duration_us,
+                collection_flags, finish_reason, duplicate_count,
+                overwritten_field_count, out_of_order_count,
+                ambiguous_index_jump_count, invalid_gas_index_count,
+                intermediate_field_count, profile_rollover_count,
+                fields_after_rollover_count, poll_count,
+                expected_fragment_count, received_fragment_bitmap,
+                missing_fragment_bitmap, duplicate_fragment_count,
+                conflicting_fragment_count, transport_complete, record_json
              ) VALUES (
-                ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12,
-                ?13, ?14, ?15, ?16
+                ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13,
+                ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24,
+                ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32, ?33, ?34, ?35
              )",
             params![
-                received_at_unix_ms,
-                node_id_text(scan.identity.node_id),
-                scan.identity.boot_id,
-                scan.identity.sequence,
-                sqlite_u64(scan.identity.uptime_ms, "uptime_ms")?,
+                first_received,
+                last_received,
+                hex_u64(scan.identity.node_id),
+                hex_u64(scan.identity.boot_id),
+                scan.identity.scan_sequence,
+                hex_u64(scan.identity.uptime_ms),
+                hex_u64(scan.identity.config_id),
+                scan.identity.common_flags,
+                scan.identity.reset_cause_flags,
                 scan.profile_id,
-                scan.profile_revision,
+                scan.profile_version,
                 scan.expected_steps,
-                observed_steps,
+                scan.observed_unique_steps,
+                scan.observed_field_count,
                 scan.reported_missing_steps,
-                scan.computed_missing_steps(),
-                scan.duration_ms,
+                scan.duplicate_steps,
+                scan.duration_us,
                 scan.collection_flags,
-                radio.packet_rssi_centi_dbm,
-                radio.snr_centi_db,
-                radio.signal_rssi_centi_dbm,
+                scan.finish_reason,
+                scan.duplicate_count,
+                scan.overwritten_field_count,
+                scan.out_of_order_count,
+                scan.ambiguous_index_jump_count,
+                scan.invalid_gas_index_count,
+                scan.intermediate_field_count,
+                scan.profile_rollover_count,
+                scan.fields_after_rollover_count,
+                scan.poll_count,
+                scan.expected_fragment_count,
+                scan.received_fragment_bitmap,
+                scan.missing_fragment_bitmap(),
+                scan.duplicate_fragment_count,
+                scan.conflicting_fragment_count,
+                scan.is_transport_complete(),
+                record_json,
             ],
         )?;
         let id = transaction.last_insert_rowid();
         for step in &scan.steps {
             transaction.execute(
-                "INSERT INTO profile_steps (
+                "INSERT INTO v2_profile_steps (
                     scan_id, step_index, gas_index, measurement_index,
-                    target_temperature_celsius, heater_duration_ms,
-                    relative_offset_ms, status_bits,
-                    temperature_centi_celsius, pressure_pascal,
-                    humidity_milli_percent_rh, gas_resistance_ohm,
-                    raw_temperature_adc, raw_pressure_adc, raw_humidity_adc,
-                    raw_gas_resistance_adc, raw_gas_range,
-                    raw_heater_resistance, raw_heater_current, raw_gas_wait
+                    status_bits, raw_measurement_status, raw_gas_status,
+                    target_temperature_celsius, configured_duration_us,
+                    relative_offset_us, temperature_centi_celsius,
+                    pressure_pascal, humidity_milli_percent_rh,
+                    gas_resistance_ohm, raw_temperature_adc, raw_pressure_adc,
+                    raw_humidity_adc, raw_gas_resistance_adc, raw_gas_range,
+                    repetition_multiplier, raw_heater_resistance,
+                    raw_heater_current, raw_gas_wait
                  ) VALUES (
-                    ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10,
-                    ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20
+                    ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12,
+                    ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23
                  )",
                 params![
                     id,
                     step.step_index,
                     step.gas_index,
                     step.measurement_index,
-                    step.target_temperature_celsius,
-                    step.heater_duration_ms,
-                    step.relative_offset_ms,
                     step.status_bits,
+                    step.raw_measurement_status,
+                    step.raw_gas_status,
+                    step.target_temperature_celsius,
+                    step.configured_duration_us,
+                    step.relative_offset_us,
                     step.temperature_centi_celsius,
                     step.pressure_pascal,
                     step.humidity_milli_percent_rh,
@@ -591,71 +804,129 @@ impl TelemetryStore {
                     step.raw_humidity_adc,
                     step.raw_gas_resistance_adc,
                     step.raw_gas_range,
+                    step.repetition_multiplier,
                     step.raw_heater_resistance,
                     step.raw_heater_current,
                     step.raw_gas_wait,
                 ],
             )?;
         }
-        for &(packet_id, fragment_index) in source_fragments {
+        for fragment in &profile.fragments {
             transaction.execute(
-                "INSERT INTO profile_scan_packets (
-                    scan_id, packet_id, fragment_index
-                 ) VALUES (?1, ?2, ?3)",
-                params![id, packet_id, fragment_index],
+                "INSERT INTO v2_profile_fragments (
+                    scan_id, packet_id, fragment_index, received_at_unix_ms,
+                    packet_rssi_centi_dbm, snr_centi_db,
+                    signal_rssi_centi_dbm
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                params![
+                    id,
+                    fragment.packet_id,
+                    fragment.fragment_index,
+                    fragment.received_at_unix_ms,
+                    fragment.radio.packet_rssi_centi_dbm,
+                    fragment.radio.snr_centi_db,
+                    fragment.radio.signal_rssi_centi_dbm,
+                ],
+            )?;
+            transaction.execute(
+                "UPDATE v2_packet_decodes SET reassembly_status = ?1
+                 WHERE packet_id = ?2",
+                params![
+                    if scan.is_transport_complete() {
+                        FragmentStorageStatus::Assembled.database_value()
+                    } else {
+                        FragmentStorageStatus::Incomplete.database_value()
+                    },
+                    fragment.packet_id,
+                ],
             )?;
         }
         transaction.commit()?;
         Ok(StoredRecord {
             id,
-            received_at_unix_ms,
+            received_at_unix_ms: last_received,
         })
     }
 
-    /// Store one decoded device-health report.
+    /// Store one exact device-health record.
     ///
     /// # Errors
     ///
-    /// Returns an error if integer conversion or the database insert fails.
+    /// Returns an error for timestamp, JSON, or `SQLite` failures.
     pub fn insert_device_health(
         &self,
         health: &DeviceHealth,
         source_packet_id: Option<i64>,
     ) -> Result<StoredRecord, StorageError> {
-        let received_at_unix_ms = current_unix_ms()?;
+        let received_at = self.packet_or_current_time(source_packet_id)?;
+        let record_json = serde_json::to_string(health)?;
         self.connection.execute(
-            "INSERT INTO device_health (
-                received_at_unix_ms, node_id, boot_id, sequence, uptime_ms,
-                reset_cause_bits, successful_scans, failed_scans,
-                incomplete_profiles, i2c_errors, radio_errors,
-                dropped_records, mcu_temperature_centi_celsius,
-                vdd_millivolt, source_packet_id
+            "INSERT INTO v2_device_health (
+                received_at_unix_ms, node_id, boot_id, scan_sequence,
+                uptime_ms, config_id, common_flags, reset_cause_flags,
+                health_flags, reset_cause_raw, successful_sensor_scans,
+                failed_sensor_scans, incomplete_profiles, i2c_errors,
+                radio_tx_errors, dropped_profiles, dropped_fragments,
+                overwritten_fields, current_sample_interval_ms,
+                firmware_version, profile_id, profile_version,
+                last_sensor_error, last_radio_error,
+                calibrated_mcu_temperature_centi_celsius,
+                calibrated_vdd_millivolt, record_json, source_packet_id
              ) VALUES (
-                ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11,
-                ?12, ?13, ?14, ?15
+                ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13,
+                ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24,
+                ?25, ?26, ?27, ?28
              )",
             params![
-                received_at_unix_ms,
-                node_id_text(health.identity.node_id),
-                health.identity.boot_id,
-                health.identity.sequence,
-                sqlite_u64(health.identity.uptime_ms, "uptime_ms")?,
-                health.reset_cause_bits,
-                health.successful_scans,
-                health.failed_scans,
+                received_at,
+                hex_u64(health.identity.node_id),
+                hex_u64(health.identity.boot_id),
+                health.identity.scan_sequence,
+                hex_u64(health.identity.uptime_ms),
+                hex_u64(health.identity.config_id),
+                health.identity.common_flags,
+                health.identity.reset_cause_flags,
+                health.health_flags,
+                health.reset_cause_raw,
+                health.successful_sensor_scans,
+                health.failed_sensor_scans,
                 health.incomplete_profiles,
                 health.i2c_errors,
-                health.radio_errors,
-                health.dropped_records,
-                health.mcu_temperature_centi_celsius,
-                health.vdd_millivolt,
+                health.radio_tx_errors,
+                health.dropped_profiles,
+                health.dropped_fragments,
+                health.overwritten_fields,
+                health.current_sample_interval_ms,
+                semver_text(health.firmware_version),
+                health.profile_id,
+                health.profile_version,
+                health.last_sensor_error,
+                health.last_radio_error,
+                health.calibrated_mcu_temperature_centi_celsius,
+                health.calibrated_vdd_millivolt,
+                record_json,
                 source_packet_id,
             ],
         )?;
         Ok(StoredRecord {
             id: self.connection.last_insert_rowid(),
-            received_at_unix_ms,
+            received_at_unix_ms: received_at,
         })
+    }
+
+    fn packet_or_current_time(&self, packet_id: Option<i64>) -> Result<i64, StorageError> {
+        if let Some(packet_id) = packet_id {
+            self.connection
+                .query_row(
+                    "SELECT received_at_unix_ms FROM radio_packets WHERE id = ?1",
+                    [packet_id],
+                    |row| row.get(0),
+                )
+                .optional()?
+                .ok_or(StorageError::MissingV2Packet { packet_id })
+        } else {
+            current_unix_ms()
+        }
     }
 
     #[cfg(test)]
@@ -664,43 +935,74 @@ impl TelemetryStore {
     }
 }
 
+fn migrate_schema_two(connection: &mut Connection) -> Result<(), StorageError> {
+    // SQLite cannot change foreign-key enforcement inside a transaction. Turn
+    // it off before rebuilding the parent table, then restore it regardless of
+    // whether the migration succeeds.
+    connection.pragma_update(None, "foreign_keys", false)?;
+    let migration = (|| -> Result<(), StorageError> {
+        let transaction = connection.transaction()?;
+        transaction.execute_batch(RADIO_PACKETS_V2_TO_V3)?;
+        // The draft schema-v2 record tables deliberately remain intact. The
+        // exact final wire model uses separately named schema-v3 tables.
+        transaction.execute_batch(SCHEMA_V3)?;
+        let violations: i64 =
+            transaction.query_row("SELECT count(*) FROM pragma_foreign_key_check", [], |row| {
+                row.get(0)
+            })?;
+        if violations != 0 {
+            return Err(StorageError::MigrationForeignKeyViolations { count: violations });
+        }
+        transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+        transaction.commit()?;
+        Ok(())
+    })();
+    let restore_foreign_keys = connection.pragma_update(None, "foreign_keys", true);
+    if let Err(error) = migration {
+        let _ = restore_foreign_keys;
+        return Err(error);
+    }
+    restore_foreign_keys?;
+    Ok(())
+}
+
 fn current_unix_ms() -> Result<i64, StorageError> {
     let elapsed = SystemTime::now().duration_since(UNIX_EPOCH)?;
     i64::try_from(elapsed.as_millis()).map_err(|_| StorageError::TimestampOutOfRange)
 }
 
-fn sqlite_u64(value: u64, field: &'static str) -> Result<i64, StorageError> {
-    i64::try_from(value).map_err(|_| StorageError::IntegerOutOfRange { field })
+fn hex_u64(value: u64) -> String {
+    format!("{value:016x}")
 }
 
-fn node_id_text(node_id: u64) -> String {
-    format!("{node_id:016x}")
+fn semver_text(version: [u8; 3]) -> String {
+    format!("{}.{}.{}", version[0], version[1], version[2])
 }
 
+#[allow(clippy::too_many_arguments)]
 fn insert_packet_at(
     connection: &Connection,
     payload: &[u8],
     radio: RadioMetadata,
-    received_at_unix_ms: i64,
+    received_at: i64,
     disposition: PacketDisposition,
+    protocol_version: Option<u8>,
+    frame_type: Option<u8>,
     decode_error: Option<&str>,
 ) -> Result<StoredPacket, StorageError> {
-    let protocol_version = payload
-        .starts_with(b"VS")
-        .then(|| payload.get(2).copied())
-        .flatten();
     connection.execute(
         "INSERT INTO radio_packets (
             received_at_unix_ms, packet_rssi_centi_dbm, snr_centi_db,
             signal_rssi_centi_dbm, protocol_version, frame_type,
             disposition, decode_error, payload
-         ) VALUES (?1, ?2, ?3, ?4, ?5, NULL, ?6, ?7, ?8)",
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
         params![
-            received_at_unix_ms,
+            received_at,
             radio.packet_rssi_centi_dbm,
             radio.snr_centi_db,
             radio.signal_rssi_centi_dbm,
             protocol_version,
+            frame_type,
             disposition.database_value(),
             decode_error,
             payload,
@@ -708,7 +1010,7 @@ fn insert_packet_at(
     )?;
     Ok(StoredPacket {
         id: connection.last_insert_rowid(),
-        received_at_unix_ms,
+        received_at_unix_ms: received_at,
     })
 }
 
@@ -717,7 +1019,7 @@ fn insert_reading_at(
     frame: &TelemetryV1,
     payload: &[u8],
     radio: RadioMetadata,
-    received_at_unix_ms: i64,
+    received_at: i64,
     radio_packet_id: Option<i64>,
 ) -> Result<StoredReading, StorageError> {
     let status = frame.sensor_status;
@@ -731,18 +1033,17 @@ fn insert_reading_at(
             raw_temperature_adc, raw_pressure_adc, raw_humidity_adc,
             raw_gas_resistance_adc, raw_gas_range, raw_gas_index,
             raw_measurement_index, raw_heater_resistance,
-            raw_heater_current, raw_gas_wait,
-            packet_rssi_centi_dbm, snr_centi_db,
-            signal_rssi_centi_dbm, payload, radio_packet_id
-        ) VALUES (
-            ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9,
-            ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18,
-            ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28
-        )",
+            raw_heater_current, raw_gas_wait, packet_rssi_centi_dbm,
+            snr_centi_db, signal_rssi_centi_dbm, payload, radio_packet_id
+         ) VALUES (
+            ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13,
+            ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24,
+            ?25, ?26, ?27, ?28
+         )",
         params![
-            received_at_unix_ms,
+            received_at,
             VERSION,
-            node_id_text(frame.node_id),
+            hex_u64(frame.node_id),
             frame.sequence,
             status.bits(),
             status.is_new_data(),
@@ -770,37 +1071,26 @@ fn insert_reading_at(
             radio_packet_id,
         ],
     )?;
-
     Ok(StoredReading {
         id: connection.last_insert_rowid(),
-        received_at_unix_ms,
+        received_at_unix_ms: received_at,
         radio_packet_id,
     })
 }
 
-/// Failure while creating or writing the telemetry database.
+/// Failure while creating, migrating, or writing the telemetry database.
 #[derive(Debug)]
 pub enum StorageError {
-    /// Filesystem setup failed.
     Io(std::io::Error),
-    /// `SQLite` operation failed.
     Sqlite(rusqlite::Error),
-    /// The host clock is earlier than the Unix epoch.
+    Json(serde_json::Error),
     SystemTime(SystemTimeError),
-    /// The millisecond timestamp cannot fit a `SQLite` integer.
     TimestampOutOfRange,
-    /// An unsigned device value cannot fit a `SQLite` signed integer.
-    IntegerOutOfRange {
-        /// Logical field that overflowed.
-        field: &'static str,
-    },
-    /// A decoded logical record is structurally inconsistent.
     InvalidRecord(RecordError),
-    /// The database schema is not understood by this executable.
-    UnsupportedSchemaVersion {
-        /// Version read from `SQLite`'s `user_version` pragma.
-        found: i64,
-    },
+    MissingV2Packet { packet_id: i64 },
+    ProfileWithoutFragments,
+    MigrationForeignKeyViolations { count: i64 },
+    UnsupportedSchemaVersion { found: i64 },
 }
 
 impl fmt::Display for StorageError {
@@ -808,14 +1098,20 @@ impl fmt::Display for StorageError {
         match self {
             Self::Io(error) => write!(formatter, "database directory error: {error}"),
             Self::Sqlite(error) => write!(formatter, "SQLite error: {error}"),
+            Self::Json(error) => write!(formatter, "record JSON error: {error}"),
             Self::SystemTime(error) => write!(formatter, "system clock error: {error}"),
-            Self::TimestampOutOfRange => {
-                formatter.write_str("receive timestamp does not fit a SQLite integer")
-            }
-            Self::IntegerOutOfRange { field } => {
-                write!(formatter, "{field} does not fit a SQLite integer")
-            }
+            Self::TimestampOutOfRange => formatter.write_str("timestamp does not fit SQLite"),
             Self::InvalidRecord(error) => write!(formatter, "invalid decoded record: {error}"),
+            Self::MissingV2Packet { packet_id } => {
+                write!(formatter, "v2 source packet {packet_id} does not exist")
+            }
+            Self::ProfileWithoutFragments => {
+                formatter.write_str("reassembled profile has no source fragments")
+            }
+            Self::MigrationForeignKeyViolations { count } => write!(
+                formatter,
+                "schema migration left {count} foreign-key violation(s)"
+            ),
             Self::UnsupportedSchemaVersion { found } => write!(
                 formatter,
                 "unsupported telemetry database schema version {found}; expected {SCHEMA_VERSION}"
@@ -829,10 +1125,13 @@ impl std::error::Error for StorageError {
         match self {
             Self::Io(error) => Some(error),
             Self::Sqlite(error) => Some(error),
+            Self::Json(error) => Some(error),
             Self::SystemTime(error) => Some(error),
             Self::InvalidRecord(error) => Some(error),
             Self::TimestampOutOfRange
-            | Self::IntegerOutOfRange { .. }
+            | Self::MissingV2Packet { .. }
+            | Self::ProfileWithoutFragments
+            | Self::MigrationForeignKeyViolations { .. }
             | Self::UnsupportedSchemaVersion { .. } => None,
         }
     }
@@ -847,6 +1146,12 @@ impl From<std::io::Error> for StorageError {
 impl From<rusqlite::Error> for StorageError {
     fn from(error: rusqlite::Error) -> Self {
         Self::Sqlite(error)
+    }
+}
+
+impl From<serde_json::Error> for StorageError {
+    fn from(error: serde_json::Error) -> Self {
+        Self::Json(error)
     }
 }
 
@@ -865,13 +1170,13 @@ impl From<RecordError> for StorageError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::records::{
-        DeviceConfiguration, DeviceHealth, HeaterStepConfiguration, ProfileScan, ProfileStep,
-        RecordIdentity,
+    use crate::reassembly::{
+        FragmentEvent, ProfileReassembler, SourceFragment, device_configuration,
     };
-    use crate::{decode_hex, parse_frame_hex};
+    use crate::{decode_hex, parse_frame_hex, parse_payload_hex};
 
     const FIXTURE: &str = "565301b001020304050607080a0b0c0dfb2e00018bcd0000b26e000f12060007eed00005902075300200080203040506";
+    const CONFIG_V2: &str = "565302013003000100b701020304050607081112131415161718ffffffff212223242526272896392f014bce77450005010302030401a0a1a2a3a4a5a6a76101760205010008030100637300017c1c0000a27600a331ea100100020a03ff01b0b1b2b3b4b5b6b70000ea6000100533be27a005070001e848040500080001001424e70300c800021e920120604000dc00043d240221614100f000065bb603226242010400087a48042363430118000a98da05246444012c000cb76c062565450140000ed5fe0726664601540010f4900827674701680013132209286848017c001531b40a296949";
 
     const fn radio() -> RadioMetadata {
         RadioMetadata {
@@ -881,87 +1186,198 @@ mod tests {
         }
     }
 
-    const fn identity(sequence: u32) -> RecordIdentity {
-        RecordIdentity {
-            node_id: 0x0102_0304_0506_0708,
-            boot_id: 0x1122_3344,
-            sequence,
-            uptime_ms: 60_000,
-        }
+    #[test]
+    fn stores_v1_fixture_byte_exact_and_links_live_packet() {
+        let mut store = TelemetryStore::open_in_memory().unwrap();
+        let frame = decode_hex(FIXTURE).unwrap();
+        let payload = parse_frame_hex(FIXTURE).unwrap();
+        let stored = store.insert_received_v1(&frame, &payload, radio()).unwrap();
+        let archived: (String, Vec<u8>) = store
+            .connection
+            .query_row(
+                "SELECT disposition, payload FROM radio_packets WHERE id = ?1",
+                [stored.radio_packet_id.unwrap()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(archived, ("v1".to_owned(), payload.to_vec()));
     }
 
-    const fn profile_step(index: u8) -> ProfileStep {
-        ProfileStep {
+    #[test]
+    fn unsupported_packets_remain_byte_exact() {
+        let store = TelemetryStore::open_in_memory().unwrap();
+        let payload = b"VS\x09future";
+        let packet = store
+            .archive_packet(payload, radio(), PacketDisposition::Unsupported, None)
+            .unwrap();
+        let archived: Vec<u8> = store
+            .connection
+            .query_row(
+                "SELECT payload FROM radio_packets WHERE id = ?1",
+                [packet.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(archived, payload);
+    }
+
+    fn protocol_step(index: u8) -> vesta_protocol::v2::ProfileStep {
+        vesta_protocol::v2::ProfileStep {
             step_index: index,
             gas_index: index,
             measurement_index: index,
-            target_temperature_celsius: 200 + index as u16 * 50,
-            heater_duration_ms: 100,
-            relative_offset_ms: index as u32 * 100,
-            status_bits: 0xb0,
+            status: 0xb0,
+            raw_measurement_status: 0x80,
+            raw_gas_status: 0x30,
+            target_temperature_celsius: 200 + u16::from(index),
+            configured_duration_us: 138_898,
+            offset_us: u32::from(index) * 138_898,
             temperature_centi_celsius: 2_500,
             pressure_pascal: 101_325,
             humidity_milli_percent_rh: 40_000,
             gas_resistance_ohm: 20_000,
-            raw_temperature_adc: 1,
-            raw_pressure_adc: 2,
-            raw_humidity_adc: 3,
-            raw_gas_resistance_adc: 4,
-            raw_gas_range: 5,
-            raw_heater_resistance: 6,
-            raw_heater_current: 7,
-            raw_gas_wait: 8,
+            temperature_adc: 1,
+            pressure_adc: 2,
+            humidity_adc: 3,
+            gas_resistance_adc: 4,
+            gas_range: 5,
+            repetition_multiplier: 1,
+            heater_resistance: 6,
+            heater_current: 7,
+            gas_wait: 8,
         }
     }
 
+    fn protocol_profile(sequence: u32) -> vesta_protocol::v2::EncodedProfile {
+        let mut steps = [None; vesta_protocol::v2::MAX_PROFILE_STEPS];
+        for index in 0..10_u8 {
+            steps[usize::from(index)] = Some(protocol_step(index));
+        }
+        vesta_protocol::v2::encode_profile(
+            vesta_protocol::v2::Common::production(
+                0x0102_0304_0506_0708,
+                u64::MAX,
+                sequence,
+                u64::MAX,
+                0x9639_2f01_4bce_7745,
+                5,
+            ),
+            &vesta_protocol::v2::ProfileScan {
+                profile_id: 0x1001,
+                profile_version: 2,
+                expected_step_count: 10,
+                observed_unique_step_count: 10,
+                observed_field_count: 10,
+                missing_steps_bitmap: 0,
+                duplicate_steps_bitmap: 0,
+                scan_duration_us: 10_695_146,
+                collection_flags: 0,
+                finish_reason: vesta_protocol::v2::FINISH_REASON_COMPLETE,
+                duplicate_count: 0,
+                overwritten_field_count: 0,
+                out_of_order_count: 0,
+                ambiguous_index_jump_count: 0,
+                invalid_gas_index_count: 0,
+                intermediate_field_count: 0,
+                profile_rollover_count: 0,
+                fields_after_rollover_count: 0,
+                poll_count: 120,
+                steps,
+            },
+        )
+        .unwrap()
+    }
+
     #[test]
-    fn stores_exact_structured_values_and_payload() {
-        let store = TelemetryStore::open_in_memory().unwrap();
-        let frame = decode_hex(FIXTURE).unwrap();
-        let payload = parse_frame_hex(FIXTURE).unwrap();
-        let radio = RadioMetadata {
-            packet_rssi_centi_dbm: -4_200,
-            snr_centi_db: 1_250,
-            signal_rssi_centi_dbm: -4_250,
+    #[allow(clippy::too_many_lines)]
+    fn stores_exact_v2_configuration_and_ten_step_profile() {
+        let mut store = TelemetryStore::open_in_memory().unwrap();
+        let config_payload = parse_payload_hex(CONFIG_V2).unwrap();
+        let vesta_protocol::v2::DecodedFrame::DeviceConfig { header, config } =
+            vesta_protocol::v2::decode(&config_payload).unwrap()
+        else {
+            unreachable!()
         };
-
-        let stored = store
-            .insert_at(&frame, &payload, radio, 1_776_550_000_123)
+        let packet = store
+            .archive_v2_packet(&config_payload, radio(), header, V2PacketKind::DeviceConfig)
             .unwrap();
-        assert_eq!(stored.id, 1);
-        assert_eq!(stored.received_at_unix_ms, 1_776_550_000_123);
-
-        let identity: (i64, String, i64, i64, Vec<u8>) = store
+        let disposition: String = store
             .connection
             .query_row(
-                "SELECT received_at_unix_ms, node_id, sequence,
-                        protocol_version, payload
-                 FROM telemetry_readings WHERE id = 1",
-                [],
-                |row| {
-                    Ok((
-                        row.get(0)?,
-                        row.get(1)?,
-                        row.get(2)?,
-                        row.get(3)?,
-                        row.get(4)?,
-                    ))
-                },
+                "SELECT disposition FROM radio_packets WHERE id = ?1",
+                [packet.id],
+                |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(identity.0, 1_776_550_000_123);
-        assert_eq!(identity.1, "0102030405060708");
-        assert_eq!(identity.2, i64::from(0x0a0b_0c0d_u32));
-        assert_eq!(identity.3, i64::from(VERSION));
-        assert_eq!(identity.4, payload);
-
-        let measurements: (i64, i64, i64, i64, i64, i64) = store
+        assert_eq!(disposition, "v2");
+        let configuration = device_configuration(header, config);
+        store
+            .insert_device_configuration(&configuration, Some(packet.id))
+            .unwrap();
+        let config_row: (String, String, i64, i64) = store
             .connection
             .query_row(
-                "SELECT temperature_centi_celsius, pressure_pascal,
-                        humidity_milli_percent_rh, gas_resistance_ohm,
-                        packet_rssi_centi_dbm, snr_centi_db
-                 FROM telemetry_readings WHERE id = 1",
+                "SELECT boot_id, config_id, output_routes,
+                        (SELECT count(*) FROM v2_heater_profile_steps)
+                 FROM v2_device_configurations",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            config_row,
+            (
+                "1112131415161718".to_owned(),
+                "96392f014bce7745".to_owned(),
+                5,
+                10,
+            )
+        );
+
+        let encoded = protocol_profile(u32::MAX);
+        let mut reassembler = ProfileReassembler::default();
+        let mut completed = None;
+        for index in [3_usize, 0, 2, 1] {
+            let payload = encoded.frames()[index].as_slice();
+            let vesta_protocol::v2::DecodedFrame::ProfileFragment(fragment) =
+                vesta_protocol::v2::decode(payload).unwrap()
+            else {
+                unreachable!()
+            };
+            let archived = store
+                .archive_v2_packet(
+                    payload,
+                    radio(),
+                    fragment.header,
+                    V2PacketKind::ProfileFragment,
+                )
+                .unwrap();
+            let result = reassembler
+                .ingest(
+                    fragment,
+                    SourceFragment {
+                        packet_id: archived.id,
+                        fragment_index: u8::try_from(index).unwrap(),
+                        received_at_unix_ms: archived.received_at_unix_ms,
+                        radio: radio(),
+                    },
+                )
+                .unwrap();
+            if let FragmentEvent::Complete(profile) = result.event {
+                completed = Some(profile);
+            }
+        }
+        let profile = completed.unwrap();
+        store.insert_profile_scan(&profile).unwrap();
+        let profile_row: (String, String, i64, i64, i64, i64) = store
+            .connection
+            .query_row(
+                "SELECT boot_id, uptime_ms, transport_complete,
+                        (SELECT count(*) FROM v2_profile_steps),
+                        (SELECT count(*) FROM v2_profile_fragments),
+                        (SELECT raw_measurement_status FROM v2_profile_steps
+                         WHERE step_index = 9)
+                 FROM v2_profile_scans",
                 [],
                 |row| {
                     Ok((
@@ -976,253 +1392,189 @@ mod tests {
             )
             .unwrap();
         assert_eq!(
-            measurements,
-            (-1_234, 101_325, 45_678, 987_654, -4_200, 1_250)
+            profile_row,
+            (
+                "ffffffffffffffff".to_owned(),
+                "ffffffffffffffff".to_owned(),
+                1,
+                10,
+                4,
+                0x80,
+            )
         );
     }
 
     #[test]
-    fn retains_repeated_node_sequence_as_distinct_observations() {
-        let store = TelemetryStore::open_in_memory().unwrap();
-        let frame = decode_hex(FIXTURE).unwrap();
-        let payload = parse_frame_hex(FIXTURE).unwrap();
-        let radio = RadioMetadata {
-            packet_rssi_centi_dbm: -4_200,
-            snr_centi_db: 1_250,
-            signal_rssi_centi_dbm: -4_200,
-        };
-
-        store.insert_at(&frame, &payload, radio, 100).unwrap();
-        store.insert_at(&frame, &payload, radio, 200).unwrap();
-
-        let count: i64 = store
-            .connection
-            .query_row("SELECT count(*) FROM telemetry_readings", [], |row| {
-                row.get(0)
-            })
-            .unwrap();
-        assert_eq!(count, 2);
-    }
-
-    #[test]
-    fn live_v1_insert_archives_and_links_the_exact_packet() {
+    fn persists_receiver_missing_fragments_without_fabricating_link_metrics() {
         let mut store = TelemetryStore::open_in_memory().unwrap();
-        let frame = decode_hex(FIXTURE).unwrap();
-        let payload = parse_frame_hex(FIXTURE).unwrap();
-
-        let stored = store.insert_received_v1(&frame, &payload, radio()).unwrap();
-        let packet_id = stored.radio_packet_id.unwrap();
-        let archived: (i64, String, i64, Vec<u8>) = store
-            .connection
-            .query_row(
-                "SELECT protocol_version, disposition,
-                        packet_rssi_centi_dbm, payload
-                 FROM radio_packets WHERE id = ?1",
-                [packet_id],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        let encoded = protocol_profile(7);
+        let payload = encoded.frames()[2].as_slice();
+        let vesta_protocol::v2::DecodedFrame::ProfileFragment(fragment) =
+            vesta_protocol::v2::decode(payload).unwrap()
+        else {
+            unreachable!()
+        };
+        let archived = store
+            .archive_v2_packet(
+                payload,
+                radio(),
+                fragment.header,
+                V2PacketKind::ProfileFragment,
             )
             .unwrap();
-        assert_eq!(archived, (1, "v1".to_owned(), -4_200, payload.to_vec()));
-
-        let linked_packet: i64 = store
-            .connection
-            .query_row(
-                "SELECT radio_packet_id FROM telemetry_readings WHERE id = ?1",
-                [stored.id],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert_eq!(linked_packet, packet_id);
-    }
-
-    #[test]
-    fn unsupported_packets_remain_byte_exact_for_future_decoders() {
-        let store = TelemetryStore::open_in_memory().unwrap();
-        let payload = b"VS\x02future-wire-record";
-        let stored = store
-            .archive_packet(payload, radio(), PacketDisposition::Unsupported, None)
-            .unwrap();
-
-        let archived: (i64, String, Option<String>, Vec<u8>) = store
-            .connection
-            .query_row(
-                "SELECT protocol_version, disposition, decode_error, payload
-                 FROM radio_packets WHERE id = ?1",
-                [stored.id],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
-            )
-            .unwrap();
-        assert_eq!(
-            archived,
-            (2, "unsupported".to_owned(), None, payload.to_vec())
-        );
-    }
-
-    #[test]
-    fn stores_configuration_profile_and_health_as_structured_records() {
-        let mut store = TelemetryStore::open_in_memory().unwrap();
-        let configuration = DeviceConfiguration {
-            identity: identity(10),
-            firmware_version: "vesta-test-abc123".to_owned(),
-            reset_cause_bits: 4,
-            sensor_variant: 1,
-            calibration_hash: Some(0x0123_4567_89ab_cdef),
-            humidity_oversampling: 2,
-            temperature_oversampling: 4,
-            pressure_oversampling: 4,
-            iir_filter: 3,
-            operation_mode: 2,
-            profile_id: 7,
-            profile_revision: 1,
-            scan_interval_ms: 60_000,
-            tx_power_centi_dbm: 1_400,
-            radio_frequency_hz: 868_100_000,
-            radio_spreading_factor: 7,
-            radio_bandwidth_hz: 125_000,
-            radio_coding_rate: 1,
-            heater_steps: vec![
-                HeaterStepConfiguration {
-                    step_index: 0,
-                    target_temperature_celsius: 200,
-                    duration_ms: 100,
+        let mut reassembler = ProfileReassembler::default();
+        reassembler
+            .ingest(
+                fragment,
+                SourceFragment {
+                    packet_id: archived.id,
+                    fragment_index: 2,
+                    received_at_unix_ms: archived.received_at_unix_ms,
+                    radio: radio(),
                 },
-                HeaterStepConfiguration {
-                    step_index: 1,
-                    target_temperature_celsius: 250,
-                    duration_ms: 100,
-                },
-            ],
-        };
-        let configuration_row = store
-            .insert_device_configuration(&configuration, None)
+            )
             .unwrap();
-
-        let scan = ProfileScan {
-            identity: identity(11),
-            profile_id: 7,
-            profile_revision: 1,
-            expected_steps: 2,
-            reported_missing_steps: 0,
-            duration_ms: 250,
-            collection_flags: 0,
-            steps: vec![profile_step(0), profile_step(1)],
-        };
-        let scan_row = store.insert_profile_scan(&scan, radio(), &[]).unwrap();
-
-        let health = DeviceHealth {
-            identity: identity(12),
-            reset_cause_bits: 4,
-            successful_scans: 100,
-            failed_scans: 2,
-            incomplete_profiles: 1,
-            i2c_errors: 1,
-            radio_errors: 3,
-            dropped_records: 4,
-            mcu_temperature_centi_celsius: Some(4_200),
-            vdd_millivolt: Some(3_290),
-        };
-        let health_row = store.insert_device_health(&health, None).unwrap();
-
-        let counts: (i64, i64, i64, i64, i64) = store
+        let profile = reassembler.drain_incomplete().pop().unwrap();
+        store.insert_profile_scan(&profile).unwrap();
+        let row: (i64, i64, i64, i64) = store
             .connection
             .query_row(
-                "SELECT
-                    (SELECT count(*) FROM device_configurations),
-                    (SELECT count(*) FROM heater_profile_steps),
-                    (SELECT count(*) FROM profile_scans),
-                    (SELECT count(*) FROM profile_steps),
-                    (SELECT count(*) FROM device_health)",
+                "SELECT received_fragment_bitmap, missing_fragment_bitmap,
+                        transport_complete,
+                        (SELECT packet_rssi_centi_dbm
+                         FROM v2_profile_fragments LIMIT 1)
+                 FROM v2_profile_scans",
                 [],
-                |row| {
-                    Ok((
-                        row.get(0)?,
-                        row.get(1)?,
-                        row.get(2)?,
-                        row.get(3)?,
-                        row.get(4)?,
-                    ))
-                },
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
             )
             .unwrap();
-        assert_eq!(counts, (1, 2, 1, 2, 1));
-        assert_eq!(
-            (configuration_row.id, scan_row.id, health_row.id),
-            (1, 1, 1)
-        );
+        assert_eq!(row, (0b0100, 0b1011, 0, -4_200));
     }
 
     #[test]
-    fn invalid_profile_is_rejected_without_partial_rows() {
-        let mut store = TelemetryStore::open_in_memory().unwrap();
-        let scan = ProfileScan {
-            identity: identity(20),
-            profile_id: 7,
-            profile_revision: 1,
-            expected_steps: 2,
-            reported_missing_steps: 0,
-            duration_ms: 250,
-            collection_flags: 0,
-            steps: vec![profile_step(0)],
-        };
-        assert!(matches!(
-            store.insert_profile_scan(&scan, radio(), &[]),
-            Err(StorageError::InvalidRecord(
-                RecordError::MissingBitmapMismatch { .. }
-            ))
-        ));
-        let count: i64 = store
-            .connection
-            .query_row("SELECT count(*) FROM profile_scans", [], |row| row.get(0))
-            .unwrap();
-        assert_eq!(count, 0);
-    }
-
-    #[test]
-    fn migrates_schema_one_without_losing_existing_readings() {
+    fn migrates_schema_one_without_losing_readings() {
         let connection = Connection::open_in_memory().unwrap();
         connection.execute_batch(SCHEMA_V1).unwrap();
-        let payload = parse_frame_hex(FIXTURE).unwrap();
-        connection
-            .execute(
-                "INSERT INTO telemetry_readings (
-                    received_at_unix_ms, protocol_version, node_id, sequence,
-                    status_bits, status_new_data, status_gas_valid,
-                    status_heater_stable, status_unknown_bits,
-                    temperature_centi_celsius, pressure_pascal,
-                    humidity_milli_percent_rh, gas_resistance_ohm,
-                    raw_temperature_adc, raw_pressure_adc, raw_humidity_adc,
-                    raw_gas_resistance_adc, raw_gas_range, raw_gas_index,
-                    raw_measurement_index, raw_heater_resistance,
-                    raw_heater_current, raw_gas_wait,
-                    packet_rssi_centi_dbm, snr_centi_db,
-                    signal_rssi_centi_dbm, payload
-                 ) VALUES (
-                    1, 1, '0102030405060708', 2,
-                    176, 1, 1, 1, 0,
-                    2500, 101325, 40000, 20000,
-                    1, 2, 3, 4, 5, 6, 7, 8, 9, 10,
-                    -4200, 1250, -4250, ?1
-                 )",
-                [payload],
-            )
-            .unwrap();
         connection.pragma_update(None, "user_version", 1).unwrap();
-
         let store = TelemetryStore::initialize(connection).unwrap();
-        let migrated: (i64, Option<i64>) = store
-            .connection
-            .query_row(
-                "SELECT count(*), max(radio_packet_id) FROM telemetry_readings",
-                [],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
-            .unwrap();
         let version: i64 = store
             .connection
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
-        assert_eq!(migrated, (1, None));
-        assert_eq!(version, SCHEMA_VERSION);
+        assert_eq!(version, 3);
+        let table_count: i64 = store
+            .connection
+            .query_row(
+                "SELECT count(*) FROM sqlite_master WHERE type='table' AND name='v2_profile_scans'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(table_count, 1);
+    }
+
+    #[test]
+    fn migrates_schema_two_without_losing_packet_ids_bytes_or_foreign_keys() {
+        let connection = Connection::open_in_memory().unwrap();
+        connection.execute_batch(SCHEMA_V1).unwrap();
+        let schema_v2 = PACKET_ARCHIVE_SCHEMA_V3.replace(
+            "('v1', 'v2', 'unsupported', 'invalid')",
+            "('v1', 'unsupported', 'invalid')",
+        );
+        connection.execute_batch(&schema_v2).unwrap();
+        connection.pragma_update(None, "user_version", 2).unwrap();
+        let payload = parse_frame_hex(FIXTURE).unwrap();
+        connection
+            .execute(
+                "INSERT INTO radio_packets (
+                    id, received_at_unix_ms, packet_rssi_centi_dbm,
+                    snr_centi_db, signal_rssi_centi_dbm, protocol_version,
+                    frame_type, disposition, decode_error, payload
+                 ) VALUES (77, 1, -4200, 1250, -4250, 1, 176, 'v1', NULL, ?1)",
+                [payload.as_slice()],
+            )
+            .unwrap();
+        let frame = decode_hex(FIXTURE).unwrap();
+        insert_reading_at(&connection, &frame, &payload, radio(), 2, Some(77)).unwrap();
+
+        let mut store = TelemetryStore::initialize(connection).unwrap();
+        let preserved: (i64, String, Vec<u8>, i64) = store
+            .connection
+            .query_row(
+                "SELECT p.id, p.disposition, p.payload, r.radio_packet_id
+                 FROM radio_packets AS p
+                 JOIN telemetry_readings AS r ON r.radio_packet_id = p.id
+                 WHERE p.id = 77",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(preserved, (77, "v1".to_owned(), payload.to_vec(), 77));
+        let foreign_key_violations: i64 = store
+            .connection
+            .query_row("SELECT count(*) FROM pragma_foreign_key_check", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(foreign_key_violations, 0);
+
+        let config_payload = parse_payload_hex(CONFIG_V2).unwrap();
+        let vesta_protocol::v2::DecodedFrame::DeviceConfig { header, .. } =
+            vesta_protocol::v2::decode(&config_payload).unwrap()
+        else {
+            unreachable!()
+        };
+        let v2_packet = store
+            .archive_v2_packet(&config_payload, radio(), header, V2PacketKind::DeviceConfig)
+            .unwrap();
+        let v2_disposition: String = store
+            .connection
+            .query_row(
+                "SELECT disposition FROM radio_packets WHERE id = ?1",
+                [v2_packet.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(v2_disposition, "v2");
+    }
+
+    #[test]
+    fn schema_two_migration_rolls_back_when_existing_foreign_keys_are_invalid() {
+        let mut connection = Connection::open_in_memory().unwrap();
+        connection.execute_batch(SCHEMA_V1).unwrap();
+        let schema_v2 = PACKET_ARCHIVE_SCHEMA_V3.replace(
+            "('v1', 'v2', 'unsupported', 'invalid')",
+            "('v1', 'unsupported', 'invalid')",
+        );
+        connection.execute_batch(&schema_v2).unwrap();
+        connection.pragma_update(None, "user_version", 2).unwrap();
+        connection
+            .pragma_update(None, "foreign_keys", false)
+            .unwrap();
+        let payload = parse_frame_hex(FIXTURE).unwrap();
+        let frame = decode_hex(FIXTURE).unwrap();
+        insert_reading_at(&connection, &frame, &payload, radio(), 2, Some(999)).unwrap();
+        connection
+            .pragma_update(None, "foreign_keys", true)
+            .unwrap();
+
+        assert!(matches!(
+            migrate_schema_two(&mut connection),
+            Err(StorageError::MigrationForeignKeyViolations { count: 1 })
+        ));
+        let version: i64 = connection
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, 2);
+        let packet_schema: String = connection
+            .query_row(
+                "SELECT sql FROM sqlite_master
+                 WHERE type = 'table' AND name = 'radio_packets'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(!packet_schema.contains("'v2'"));
     }
 
     #[test]
@@ -1233,5 +1585,12 @@ mod tests {
             TelemetryStore::initialize(connection),
             Err(StorageError::UnsupportedSchemaVersion { found: 99 })
         ));
+    }
+
+    #[test]
+    fn frame_type_values_match_wire_discriminants() {
+        assert_eq!(FrameType::DeviceConfig as u8, 1);
+        assert_eq!(FrameType::ProfileFragment as u8, 2);
+        assert_eq!(FrameType::DeviceHealth as u8, 3);
     }
 }

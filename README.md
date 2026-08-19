@@ -5,8 +5,9 @@ detection nodes.
 
 The workspace is split into two layers:
 
-- `vesta-protocol` is a dependency-free `no_std` codec for the exact 48-byte
-  payload emitted by the embedded firmware.
+- `vesta-protocol` is a dependency-free `no_std` codec. It preserves the exact
+  deployed 48-byte v1 API and adds variable-length protocol-v2 configuration,
+  profile-fragment, and health records.
 - `vesta-receiver` is a host CLI that receives through a Raspberry Pi
   Waveshare SX1262 HAT or decodes captured hexadecimal frames. It emits
   human-readable text or exact-integer JSONL.
@@ -29,10 +30,14 @@ taskset -c 0 cargo run -j1 -p vesta-receiver -- \
 
 Use `--count N` to stop after `N` valid frames. Diagnostics and the final
 counter summary go to standard error, leaving standard output as clean JSONL.
-Every PHY-valid packet is committed to `data/vesta-telemetry.sqlite3`; decoded
-version-1 frames are then linked to their raw packet before being printed.
-Unknown future records and decoder failures are archived rather than silently
-dropped. Override the location with `--database PATH`.
+Every PHY-valid packet is committed to `data/vesta-telemetry.sqlite3` before
+logical processing. Decoded v1 readings and v2 configuration/health records
+are linked to their source packet. V2 profile fragments are reassembled by
+`(node_id, boot_id, scan_sequence, config_id)` in deterministic 3/3/3/1
+windows; each fragment keeps its own receiver timestamp, RSSI, and SNR.
+Unknown versions, malformed records, duplicates, conflicts, and incomplete
+profiles remain auditable rather than being silently dropped. Override the
+location with `--database PATH`.
 The driver is RX-only: it exposes no transmit command, keeps the HAT's BCM6 RF
 control in its documented RX state, and returns the radio to standby when the
 process exits normally or receives SIGINT/SIGTERM.
@@ -42,10 +47,12 @@ The one-core, one-job prefix is recommended for this Pi until it has a verified
 
 ## SQLite telemetry storage
 
-The schema-version-2 database retains one `telemetry_readings` row per valid
+The schema-version-3 database retains one `telemetry_readings` row per valid
 legacy observation and an exact `radio_packets` row for every PHY-valid LoRa
-payload. A schema-version-1 database is migrated transactionally. Legacy
-telemetry preserves:
+payload. Schema versions 1 and the draft version 2 are migrated transactionally
+without losing archived bytes, packet IDs, or foreign-key links. The schema-2
+packet table is rebuilt solely to add the authoritative `v2` disposition; its
+draft record tables remain untouched. Legacy telemetry preserves:
 
 - UTC receive time, fixed-width node ID, protocol version, and sequence
 - exact status bits plus decoded status flags
@@ -53,8 +60,9 @@ telemetry preserves:
 - packet RSSI, SNR, and signal RSSI in exact centi-units
 - the original 48-byte payload as a BLOB for later audit or reprocessing
 
-The additional structured tables are ready for version-2 device configuration,
-multi-step BME688 profiles, fragment provenance, and device-health records.
+The `v2_*` tables store exact u64 identities as fixed-width hexadecimal text,
+microsecond acquisition timing, raw BME688 status/register values, every
+collector counter, deterministic fragment provenance, and periodic health.
 Protocol-independent validation and feature extraction provide quality flags,
 per-minute environmental rates, and heater-profile gas shape without claiming
 to classify a fire. See [Server-side analysis](docs/server-analysis.md).
@@ -131,17 +139,17 @@ RUSTDOCFLAGS='-D warnings' cargo doc --workspace --all-features --no-deps --lock
 cargo check -p vesta-protocol --no-default-features --target thumbv7em-none-eabi --locked
 ```
 
-The tests include the byte-for-byte fixture shared with the transmitter,
-signed and unsigned boundaries, all truncated lengths, protocol failures, hex
-input failures, JSON units, CLI exit codes, mixed valid/invalid streams, SX1262
-IRQ precedence, frequency configuration, packet-status conversion, exact
-SQLite inserts, raw-packet archival, schema migration, structured configuration,
-profile and health storage, quality gates, feature extraction, duplicate
-observations, and schema-version rejection.
+The tests include the unchanged v1 fixture; exact v2 configuration,
+four-fragment profile, and health goldens; malformed lengths and coordinates; a
+ten-step scan proving three BME fields are not mistaken for a complete profile;
+out-of-order, duplicate, missing, and bounded-eviction reassembly; exact SQLite
+inserts and migrations; SX1262 behavior; quality gates; and CLI dispatch for
+both protocol versions.
 
 ## Protocol and radio
 
 - [Version 1 wire format](docs/wire-format-v1.md)
+- [Version 2 wire format](docs/PROTOCOL_V2.md)
 - [Waveshare SX1262 Raspberry Pi bring-up](docs/waveshare-sx1262-hat.md)
 - [Server-side analysis and version-2 integration](docs/server-analysis.md)
 

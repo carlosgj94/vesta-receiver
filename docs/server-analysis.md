@@ -13,46 +13,49 @@ before that data exists would make the system look more certain than it is.
 
 ## Durable SQLite records
 
-Schema version 2 keeps the legacy `telemetry_readings` table and adds:
+Schema version 3 keeps the legacy `telemetry_readings` and raw `radio_packets`
+tables and adds exact protocol-v2 tables:
 
-- `radio_packets`: every payload accepted by the LoRa PHY, including unknown
-  versions and decoder failures, together with exact RSSI/SNR metadata;
-- `device_configurations` and `heater_profile_steps`: the firmware, sensor,
-  radio, acquisition interval, and ordered BME688 heater profile used to
-  produce measurements;
-- `profile_scans` and `profile_steps`: one acquisition plus every recovered
-  heater-step value, raw ADC field, status bit, and expected/missing-step
-  marker;
-- `profile_scan_packets`: links a reassembled scan back to its original radio
-  fragments for byte-level audit;
-- `device_health`: boot/reset identity, acquisition errors, dropped records,
-  and optional calibrated MCU temperature and supply measurements.
+- `v2_packet_decodes`: version/type/common identity and receiver-side
+  reassembly state for each decoded v2 packet;
+- `v2_device_configurations` and `v2_heater_profile_steps`: exact firmware,
+  sensor, output route, radio, cadence, calibration fingerprint, quantized
+  timing, read-back registers, and ordered BME688 profile;
+- `v2_profile_scans` and `v2_profile_steps`: all sensor collection counters,
+  microsecond timing, raw status bytes, compensated/raw channels, and separate
+  sensor-missing versus receiver-missing bitmaps;
+- `v2_profile_fragments`: links each unique fragment to its raw packet and its
+  own receiver timestamp/RSSI/SNR instead of inventing a scan-level link value;
+- `v2_device_health`: reset identity, sensor/I2C/radio/drop counters, firmware
+  and profile versions, and only explicitly calibrated optional MCU readings.
 
-Opening a schema-version-1 database migrates it transactionally. Existing
-legacy readings remain intact; their new `radio_packet_id` is null because the
-old database did not have a separate packet archive.
+Unsigned 64-bit node, boot, config, build, calibration, and uptime values are
+stored as fixed-width hexadecimal text where SQLite's signed integer cannot
+represent their full range. Canonical JSON records are retained alongside
+queryable columns so no less-common configuration field is lost.
 
-The live receiver currently decodes version-1 48-byte records. Other lengths
-or protocol versions are stored as `unsupported`, not discarded. A malformed
-version-1 candidate is stored as `invalid` with the decoder error. The SX1262
-is configured for explicit headers and payloads up to 255 bytes so the exact
-future protocol does not have to fit the old 48-byte ceiling.
+Opening schema version 1 or the prior draft schema version 2 migrates
+transactionally. Draft record tables are not rebuilt or deleted. For a schema-2
+database, `radio_packets` is rebuilt with the expanded `v2` disposition while
+preserving packet IDs, payloads, metadata, and existing foreign-key links; a
+foreign-key check runs before initialization succeeds. `v2_packet_decodes`
+records the exact v2 frame kind and receiver-side reassembly state.
 
 ## Protocol-independent input records
 
-`records.rs` defines the objects the eventual version-2 decoder must produce:
+`records.rs` defines the exact objects produced by the version-2 decoder:
 
 - `DeviceConfiguration`
 - `ProfileScan` containing ordered `ProfileStep` values
 - `DeviceHealth`
 
-These types do not assume byte offsets, fragmentation rules, or a frame-type
-number. That information belongs in the wire codec once the embedded firmware
-publishes its exact protocol specification and golden byte fixtures.
+Wire offsets and structural rules remain in the allocation-free
+`vesta-protocol::v2` codec. The host records preserve exact units while keeping
+storage and analysis independent from byte offsets.
 
-Structural validation rejects impossible profile counts, non-contiguous
-configuration steps, duplicate/out-of-range measurements, and missing-step
-bitmaps that disagree with the decoded steps. Sensor-invalid or
+Structural validation rejects impossible counts, non-contiguous configuration
+steps, duplicate/out-of-range measurements, inconsistent counters, and data
+attributed to a radio fragment the receiver never obtained. Sensor-invalid or
 heater-unstable measurements are still stored: they are evidence, but they are
 gated out of model-ready features.
 
@@ -83,21 +86,26 @@ per-step log-gas response and its offset from the scan mean. The step vector,
 profile ID, and profile revision must remain together: measurements from
 different heater programs are not directly comparable.
 
-## Version-2 integration checklist
+## Version-2 receiver behavior
 
-When the embedded implementation is ready, the server-side codec must be
-implemented from its final wire document and golden frames, not by guessing.
-The integration is complete only when it:
+The implemented receiver:
 
-1. authenticates frame magic/version/type and validates every length/checksum;
-2. archives the packet before attempting logical reassembly;
-3. reassembles fragments by node, boot ID, sequence, and fragment identity with
-   bounded memory and expiry;
-4. maps decoded data into the protocol-independent records above;
-5. stores the logical record and source-packet links transactionally;
-6. proves byte-for-byte compatibility with fixtures produced by the embedded
-   encoder, including truncated, duplicate, reordered, and missing fragments;
-7. reprocesses any already archived `unsupported` v2 packets after deployment.
+1. dispatches on magic/version and validates every v2 type, length, flag,
+   fragment coordinate, config hash, step window, and optional health TLV;
+2. archives each PHY-valid packet before logical processing;
+3. reassembles profiles by `(node_id, boot_id, scan_sequence, config_id)` with
+   bounded memory, a 120-second expiry, fixed 3/3/3/1 windows, and explicit
+   duplicate/conflict/missing outcomes;
+4. persists complete profiles immediately and incomplete profiles on expiry,
+   capacity eviction, or graceful shutdown;
+5. keeps receiver timestamp/RSSI/SNR solely on source-fragment rows;
+6. proves v1 byte compatibility plus v2 golden, maximum, malformed,
+   out-of-order, duplicate, missing, and ten-step behavior in host tests.
+
+Before deployment, any v2 frames archived by an older receiver as unsupported
+still require an explicit reprocessing command; this repository does not yet
+provide that one-shot backfill tool. Newly decoded v2 frames are stored as
+`radio_packets.disposition = 'v2'`.
 
 Only after representative labeled datasets are collected should the server add
 baseline adaptation, cross-sensor fusion, fire/nuisance classification,

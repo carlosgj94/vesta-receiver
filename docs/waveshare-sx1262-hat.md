@@ -71,7 +71,7 @@ The Pi must match the transmitter exactly:
 | PHY CRC | enabled |
 | IQ | normal |
 | private sync word | `0x1424` |
-| payload | 48 bytes |
+| payload | v1: 48 bytes; v2: variable, at most 255 bytes |
 
 ## Rust backend
 
@@ -92,8 +92,9 @@ the radio enters standby RC while NSS, reset, and BCM6 remain high.
 The IRQ classifier rejects header errors first and CRC errors second, before it
 will accept `RxDone`. This ordering matters because multiple SX1262 IRQ flags
 can be set together. A corrupt payload is never read or passed to the Vesta
-decoder. Payloads with a valid PHY CRC but a length other than 48 bytes, or an
-invalid Vesta header, are also rejected and counted.
+decoder. Every PHY-valid payload up to 255 bytes is archived; unsupported or
+malformed application records are marked in storage without being mistaken
+for successful telemetry.
 
 The implementation is intentionally direct instead of using `lora-phy` 3.0.1:
 that upstream version processes `RxDone` after merely logging simultaneous

@@ -62,7 +62,7 @@ pub struct AnalysisSample {
     /// Stable device node identity.
     pub node_id: u64,
     /// Optional boot nonce, unavailable in protocol v1.
-    pub boot_id: Option<u32>,
+    pub boot_id: Option<u64>,
     /// Sequence within the protocol stream or profile stream.
     pub sequence: u32,
     /// Host receive time in Unix milliseconds.
@@ -111,7 +111,7 @@ impl AnalysisSample {
         Self {
             node_id: scan.identity.node_id,
             boot_id: Some(scan.identity.boot_id),
-            sequence: scan.identity.sequence,
+            sequence: scan.identity.scan_sequence,
             received_at_unix_ms,
             temperature_centi_celsius: step.temperature_centi_celsius,
             pressure_pascal: step.pressure_pascal,
@@ -134,7 +134,7 @@ pub struct TemporalFeatures {
     /// Stable node identity.
     pub node_id: u64,
     /// Optional boot nonce.
-    pub boot_id: Option<u32>,
+    pub boot_id: Option<u64>,
     /// Device sequence.
     pub sequence: u32,
     /// Host receive time in Unix milliseconds.
@@ -164,7 +164,7 @@ pub struct TemporalFeatures {
 /// Stateful chronological feature extractor, isolated per node and boot.
 #[derive(Debug, Default)]
 pub struct TemporalFeatureExtractor {
-    previous: HashMap<(u64, Option<u32>), AnalysisSample>,
+    previous: HashMap<(u64, Option<u64>), AnalysisSample>,
 }
 
 impl TemporalFeatureExtractor {
@@ -240,7 +240,7 @@ pub struct ProfileFeatures {
     /// Stable node identity.
     pub node_id: u64,
     /// Per-boot nonce.
-    pub boot_id: u32,
+    pub boot_id: u64,
     /// Profile scan sequence.
     pub sequence: u32,
     /// Profile identifier.
@@ -313,15 +313,16 @@ pub fn extract_profile_features(scan: &ProfileScan) -> ProfileFeatures {
     }
 
     let usable = structural_valid
-        && scan.computed_missing_steps() == 0
+        && scan.is_transport_complete()
+        && scan.computed_unavailable_steps() == 0
         && steps.iter().all(|step| step.quality_flags == 0);
     ProfileFeatures {
         node_id: scan.identity.node_id,
         boot_id: scan.identity.boot_id,
-        sequence: scan.identity.sequence,
+        sequence: scan.identity.scan_sequence,
         profile_id: scan.profile_id,
-        profile_revision: scan.profile_revision,
-        missing_steps: scan.computed_missing_steps(),
+        profile_revision: scan.profile_version,
+        missing_steps: scan.computed_unavailable_steps(),
         usable_for_analysis: usable,
         steps,
     }
@@ -381,10 +382,12 @@ mod tests {
             step_index: index,
             gas_index: index,
             measurement_index: index,
-            target_temperature_celsius: 200 + u16::from(index) * 50,
-            heater_duration_ms: 100,
-            relative_offset_ms: u32::from(index) * 100,
             status_bits,
+            raw_measurement_status: status_bits & 0x80,
+            raw_gas_status: status_bits & 0x30,
+            target_temperature_celsius: 200 + u16::from(index) * 50,
+            configured_duration_us: 100_000,
+            relative_offset_us: u32::from(index) * 100_000,
             temperature_centi_celsius: 2_500,
             pressure_pascal: 101_325,
             humidity_milli_percent_rh: 40_000,
@@ -394,6 +397,7 @@ mod tests {
             raw_humidity_adc: 3,
             raw_gas_resistance_adc: 4,
             raw_gas_range: 5,
+            repetition_multiplier: 1,
             raw_heater_resistance: 6,
             raw_heater_current: 7,
             raw_gas_wait: 8,
@@ -448,17 +452,37 @@ mod tests {
     fn profile_features_preserve_shape_and_gate_bad_steps() {
         let scan = ProfileScan {
             identity: RecordIdentity {
+                common_flags: 3,
                 node_id: 1,
                 boot_id: 2,
-                sequence: 3,
+                scan_sequence: 3,
                 uptime_ms: 4,
+                config_id: 7,
+                reset_cause_flags: 0,
             },
             profile_id: 5,
-            profile_revision: 6,
+            profile_version: 6,
             expected_steps: 3,
+            observed_unique_steps: 3,
+            observed_field_count: 3,
             reported_missing_steps: 0,
-            duration_ms: 300,
+            duplicate_steps: 0,
+            duration_us: 300_000,
             collection_flags: 0,
+            finish_reason: 0,
+            duplicate_count: 0,
+            overwritten_field_count: 0,
+            out_of_order_count: 0,
+            ambiguous_index_jump_count: 0,
+            invalid_gas_index_count: 0,
+            intermediate_field_count: 0,
+            profile_rollover_count: 0,
+            fields_after_rollover_count: 0,
+            poll_count: 6,
+            expected_fragment_count: 1,
+            received_fragment_bitmap: 1,
+            duplicate_fragment_count: 0,
+            conflicting_fragment_count: 0,
             steps: vec![
                 profile_step(2, 30_000, 0xb0),
                 profile_step(0, 10_000, 0xb0),

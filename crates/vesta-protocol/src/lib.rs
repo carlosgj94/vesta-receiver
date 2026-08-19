@@ -8,6 +8,9 @@
 
 use core::fmt;
 
+/// Allocation-free protocol-v2 records and codec.
+pub mod v2;
+
 /// Number of bytes in a version 1 telemetry frame.
 pub const FRAME_LEN: usize = 48;
 
@@ -16,6 +19,89 @@ pub const MAGIC: [u8; 2] = *b"VS";
 
 /// Wire-format version understood by this crate.
 pub const VERSION: u8 = 1;
+
+/// A decoded Vesta frame selected by its on-wire version byte.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DecodedTelemetry<'a> {
+    /// Deployed fixed-size protocol-v1 telemetry.
+    V1(TelemetryV1),
+    /// A validated variable-size protocol-v2 record.
+    V2(v2::DecodedFrame<'a>),
+}
+
+/// Decode either supported protocol version without guessing from length.
+///
+/// # Errors
+///
+/// Returns [`ProtocolDecodeError`] for a truncated discriminator, invalid
+/// magic, unsupported version, or a version-specific structural error.
+pub fn decode_any(bytes: &[u8]) -> Result<DecodedTelemetry<'_>, ProtocolDecodeError> {
+    if bytes.len() < 3 {
+        return Err(ProtocolDecodeError::TruncatedDiscriminator {
+            actual: bytes.len(),
+        });
+    }
+    let found_magic = [bytes[0], bytes[1]];
+    if found_magic != MAGIC {
+        return Err(ProtocolDecodeError::InvalidMagic { found: found_magic });
+    }
+    match bytes[2] {
+        VERSION => TelemetryV1::decode(bytes)
+            .map(DecodedTelemetry::V1)
+            .map_err(ProtocolDecodeError::V1),
+        v2::VERSION_V2 => v2::decode(bytes)
+            .map(DecodedTelemetry::V2)
+            .map_err(ProtocolDecodeError::V2),
+        found => Err(ProtocolDecodeError::UnsupportedVersion { found }),
+    }
+}
+
+/// Failure while selecting or decoding a versioned Vesta frame.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ProtocolDecodeError {
+    /// Fewer than the magic and version bytes were supplied.
+    TruncatedDiscriminator {
+        /// Number of supplied bytes.
+        actual: usize,
+    },
+    /// The first two bytes were not [`MAGIC`].
+    InvalidMagic {
+        /// Discriminator found in the input.
+        found: [u8; 2],
+    },
+    /// The version byte is not supported by this codec.
+    UnsupportedVersion {
+        /// Version byte found in the input.
+        found: u8,
+    },
+    /// Protocol-v1 decoding failed.
+    V1(DecodeError),
+    /// Protocol-v2 decoding failed.
+    V2(v2::Error),
+}
+
+impl fmt::Display for ProtocolDecodeError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::TruncatedDiscriminator { actual } => {
+                write!(
+                    formatter,
+                    "truncated Vesta discriminator: got {actual} bytes"
+                )
+            }
+            Self::InvalidMagic { found } => write!(
+                formatter,
+                "invalid frame magic: expected {:02x}{:02x}, got {:02x}{:02x}",
+                MAGIC[0], MAGIC[1], found[0], found[1]
+            ),
+            Self::UnsupportedVersion { found } => {
+                write!(formatter, "unsupported frame version: {found}")
+            }
+            Self::V1(error) => write!(formatter, "invalid protocol-v1 frame: {error}"),
+            Self::V2(error) => write!(formatter, "invalid protocol-v2 frame: {error}"),
+        }
+    }
+}
 
 /// One hundredth of a degree Celsius.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]

@@ -3,6 +3,7 @@
 
 pub mod analysis;
 pub mod database;
+pub mod reassembly;
 pub mod records;
 #[cfg(target_os = "linux")]
 pub mod sx1262;
@@ -10,7 +11,12 @@ pub mod sx1262;
 use core::fmt;
 
 use serde::Serialize;
+use serde_json::{Value, json};
+use vesta_protocol::v2::{DecodedFrame as DecodedFrameV2, ProfileFragmentView};
 use vesta_protocol::{DecodeError, FRAME_LEN, TelemetryV1, VERSION};
+
+use crate::reassembly::{ReassembledProfile, device_configuration, device_health, fragment_steps};
+use crate::records::RecordIdentity;
 
 /// Number of hexadecimal characters in one version 1 frame.
 pub const FRAME_HEX_LEN: usize = FRAME_LEN * 2;
@@ -63,6 +69,52 @@ pub fn parse_frame_hex(input: &str) -> Result<[u8; FRAME_LEN], HexError> {
         *output = (high << 4) | low;
     }
     Ok(frame)
+}
+
+/// Parse a variable-length Vesta frame from hexadecimal text.
+///
+/// Version 2 frames may contain between 48 and 255 bytes. This parser accepts
+/// any whole-byte payload from 3 through 255 bytes and leaves exact
+/// version-specific length validation to `vesta-protocol`.
+///
+/// # Errors
+///
+/// Returns [`HexError`] for odd length, an out-of-range payload, or a
+/// non-hexadecimal character.
+pub fn parse_payload_hex(input: &str) -> Result<Vec<u8>, HexError> {
+    let input = input
+        .strip_prefix("0x")
+        .or_else(|| input.strip_prefix("0X"))
+        .unwrap_or(input);
+    if input.len() % 2 != 0 {
+        return Err(HexError::OddLength {
+            actual: input.len(),
+        });
+    }
+    let byte_len = input.len() / 2;
+    if !(3..=vesta_protocol::v2::MAX_PHY_FRAME_LEN).contains(&byte_len) {
+        return Err(HexError::PayloadLength {
+            minimum: 3,
+            maximum: vesta_protocol::v2::MAX_PHY_FRAME_LEN,
+            actual: byte_len,
+        });
+    }
+    let source = input.as_bytes();
+    let mut payload = Vec::with_capacity(byte_len);
+    for index in 0..byte_len {
+        let high_index = index * 2;
+        let low_index = high_index + 1;
+        let high = hex_nibble(source[high_index]).ok_or(HexError::InvalidByte {
+            index: high_index,
+            found: source[high_index],
+        })?;
+        let low = hex_nibble(source[low_index]).ok_or(HexError::InvalidByte {
+            index: low_index,
+            found: source[low_index],
+        })?;
+        payload.push((high << 4) | low);
+    }
+    Ok(payload)
 }
 
 const fn hex_nibble(byte: u8) -> Option<u8> {
@@ -126,6 +178,175 @@ pub fn render_received(
             frame: JsonFrame::from(frame),
             radio,
         }),
+    }
+}
+
+/// Render one decoded protocol-v2 frame.
+///
+/// Device-originated identity values that exceed JavaScript's safe integer
+/// range are emitted as fixed-width hexadecimal strings. Receiver RSSI/SNR is
+/// included only when supplied by the receiver call site.
+///
+/// # Errors
+///
+/// Returns an error if a profile step cannot be extracted or JSON generation
+/// fails.
+pub fn render_v2(
+    frame: DecodedFrameV2<'_>,
+    format: OutputFormat,
+    radio: Option<RadioMetadata>,
+) -> Result<String, V2RenderError> {
+    let value = match frame {
+        DecodedFrameV2::DeviceConfig { header, config } => {
+            let record = device_configuration(header, config);
+            let identity = record.identity;
+            let firmware_build_id = record.firmware_build_id;
+            let calibration_hash = record.calibration_hash;
+            let mut record_value = serde_json::to_value(record)?;
+            exactify_identity(&mut record_value, identity);
+            record_value["firmware_build_id"] = Value::String(hex_u64(firmware_build_id));
+            record_value["calibration_hash"] = Value::String(hex_u64(calibration_hash));
+            json!({
+                "protocol_version": 2,
+                "frame_type": "device_config",
+                "record": record_value,
+                "radio": radio,
+            })
+        }
+        DecodedFrameV2::ProfileFragment(fragment) => fragment_json(fragment, radio)?,
+        DecodedFrameV2::DeviceHealth { header, health } => {
+            let record = device_health(header, health);
+            let identity = record.identity;
+            let mut record_value = serde_json::to_value(record)?;
+            exactify_identity(&mut record_value, identity);
+            json!({
+                "protocol_version": 2,
+                "frame_type": "device_health",
+                "record": record_value,
+                "radio": radio,
+            })
+        }
+    };
+    match format {
+        OutputFormat::Human => serde_json::to_string_pretty(&value).map_err(V2RenderError::Json),
+        OutputFormat::JsonLines => serde_json::to_string(&value).map_err(V2RenderError::Json),
+    }
+}
+
+/// Render a complete or explicitly receiver-incomplete logical profile.
+///
+/// # Errors
+///
+/// Returns an error if JSON generation fails.
+pub fn render_reassembled_profile(
+    profile: &ReassembledProfile,
+    format: OutputFormat,
+) -> Result<String, serde_json::Error> {
+    let mut record = serde_json::to_value(&profile.scan)?;
+    exactify_identity(&mut record, profile.scan.identity);
+    let value = json!({
+        "protocol_version": 2,
+        "frame_type": "profile_scan",
+        "record": record,
+        "receiver_fragments": profile.fragments,
+    });
+    match format {
+        OutputFormat::Human => serde_json::to_string_pretty(&value),
+        OutputFormat::JsonLines => serde_json::to_string(&value),
+    }
+}
+
+fn fragment_json(
+    fragment: ProfileFragmentView<'_>,
+    radio: Option<RadioMetadata>,
+) -> Result<Value, V2RenderError> {
+    let identity = crate::reassembly::record_identity(fragment.header);
+    let steps = fragment_steps(fragment)?;
+    Ok(json!({
+        "protocol_version": 2,
+        "frame_type": "profile_fragment",
+        "identity": identity_json(identity),
+        "fragment_index": fragment.header.fragment_index,
+        "fragment_count": fragment.header.fragment_count,
+        "profile_id": fragment.profile_id,
+        "profile_version": fragment.profile_version,
+        "expected_step_count": fragment.expected_step_count,
+        "observed_unique_step_count": fragment.observed_unique_step_count,
+        "observed_field_count": fragment.observed_field_count,
+        "missing_steps_bitmap": fragment.missing_steps_bitmap,
+        "duplicate_steps_bitmap": fragment.duplicate_steps_bitmap,
+        "scan_duration_us": fragment.scan_duration_us,
+        "collection_flags": fragment.collection_flags,
+        "finish_reason": fragment.finish_reason,
+        "duplicate_count": fragment.duplicate_count,
+        "overwritten_field_count": fragment.overwritten_field_count,
+        "out_of_order_count": fragment.out_of_order_count,
+        "ambiguous_index_jump_count": fragment.ambiguous_index_jump_count,
+        "invalid_gas_index_count": fragment.invalid_gas_index_count,
+        "intermediate_field_count": fragment.intermediate_field_count,
+        "profile_rollover_count": fragment.profile_rollover_count,
+        "fields_after_rollover_count": fragment.fields_after_rollover_count,
+        "poll_count": fragment.poll_count,
+        "step_window_start": fragment.step_window_start,
+        "steps": steps,
+        "radio": radio,
+    }))
+}
+
+fn exactify_identity(value: &mut Value, identity: RecordIdentity) {
+    value["identity"] = identity_json(identity);
+}
+
+fn identity_json(identity: RecordIdentity) -> Value {
+    json!({
+        "common_flags": identity.common_flags,
+        "node_id": hex_u64(identity.node_id),
+        "boot_id": hex_u64(identity.boot_id),
+        "scan_sequence": identity.scan_sequence,
+        "uptime_ms": identity.uptime_ms.to_string(),
+        "config_id": hex_u64(identity.config_id),
+        "reset_cause_flags": identity.reset_cause_flags,
+    })
+}
+
+fn hex_u64(value: u64) -> String {
+    format!("{value:016x}")
+}
+
+/// Failure while rendering a protocol-v2 record.
+#[derive(Debug)]
+pub enum V2RenderError {
+    Codec(vesta_protocol::v2::Error),
+    Json(serde_json::Error),
+}
+
+impl fmt::Display for V2RenderError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Codec(error) => write!(formatter, "invalid profile fragment: {error}"),
+            Self::Json(error) => write!(formatter, "could not serialize v2 record: {error}"),
+        }
+    }
+}
+
+impl std::error::Error for V2RenderError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Codec(_) => None,
+            Self::Json(error) => Some(error),
+        }
+    }
+}
+
+impl From<vesta_protocol::v2::Error> for V2RenderError {
+    fn from(error: vesta_protocol::v2::Error) -> Self {
+        Self::Codec(error)
+    }
+}
+
+impl From<serde_json::Error> for V2RenderError {
+    fn from(error: serde_json::Error) -> Self {
+        Self::Json(error)
     }
 }
 
@@ -335,6 +556,20 @@ pub enum HexError {
         /// Supplied byte length after removing an optional prefix.
         actual: usize,
     },
+    /// A variable-size payload contains half of a byte.
+    OddLength {
+        /// Supplied count of hexadecimal characters.
+        actual: usize,
+    },
+    /// A variable-size payload is too short or exceeds the `LoRa` PHY maximum.
+    PayloadLength {
+        /// Smallest accepted byte count.
+        minimum: usize,
+        /// Largest accepted byte count.
+        maximum: usize,
+        /// Supplied byte count.
+        actual: usize,
+    },
     /// A byte is not an ASCII hexadecimal digit.
     InvalidByte {
         /// Zero-based byte position after removing an optional prefix.
@@ -350,6 +585,17 @@ impl fmt::Display for HexError {
             Self::WrongLength { expected, actual } => write!(
                 formatter,
                 "wrong hexadecimal length: expected {expected} characters, got {actual}"
+            ),
+            Self::OddLength { actual } => {
+                write!(formatter, "odd hexadecimal length: got {actual} characters")
+            }
+            Self::PayloadLength {
+                minimum,
+                maximum,
+                actual,
+            } => write!(
+                formatter,
+                "payload length must be {minimum}..={maximum} bytes, got {actual}"
             ),
             Self::InvalidByte { index, found } => write!(
                 formatter,
