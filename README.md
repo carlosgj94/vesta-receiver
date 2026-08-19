@@ -33,11 +33,23 @@ counter summary go to standard error, leaving standard output as clean JSONL.
 Every PHY-valid packet is committed to `data/vesta-telemetry.sqlite3` before
 logical processing. Decoded v1 readings and v2 configuration/health records
 are linked to their source packet. V2 profile fragments are reassembled by
-`(node_id, boot_id, scan_sequence, config_id)` in deterministic 3/3/3/1
-windows; each fragment keeps its own receiver timestamp, RSSI, and SNR.
+`(node_id, boot_id_valid, boot_id, scan_sequence, scan_start_uptime_ms,
+config_id)` in deterministic 3/3/3/1 windows. Including validity and uptime
+reduces—but cannot eliminate—cross-boot ambiguity when the hardware RNG is
+unavailable; those scans never feed temporal history. Each fragment keeps its
+own receiver timestamp, RSSI, and SNR.
 Unknown versions, malformed records, duplicates, conflicts, and incomplete
 profiles remain auditable rather than being silently dropped. Override the
 location with `--database PATH`.
+At startup the receiver replays at most 1,024 archived `pending` profile
+fragments before opening the radio, so a process restart can finish a scan.
+The bound is fail-closed rather than silently replaying a prefix. Live expiry
+uses monotonic elapsed time, while Unix receive timestamps remain untouched as
+record provenance.
+Fragments are also compared with persisted complete scans by full logical key
+and exact archived bytes. A late conflict durably invalidates the stored scan
+and emits a `profile_integrity_update` JSONL event, even after restart or
+in-memory cache expiry; a retransmission cannot silently create a second scan.
 The driver is RX-only: it exposes no transmit command, keeps the HAT's BCM6 RF
 control in its documented RX state, and returns the radio to standby when the
 process exits normally or receives SIGINT/SIGTERM.

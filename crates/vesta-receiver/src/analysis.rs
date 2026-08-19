@@ -8,6 +8,10 @@ use std::collections::HashMap;
 
 use serde::Serialize;
 use vesta_protocol::TelemetryV1;
+use vesta_protocol::v2::{
+    COLLECTION_FLAG_DUPLICATE, COLLECTION_FLAG_SENSOR_RECONFIGURED, COMMON_FLAG_BOOT_ID_VALID,
+    FINISH_REASON_COMPLETE,
+};
 
 use crate::records::{ProfileScan, ProfileStep};
 
@@ -16,6 +20,14 @@ const MAX_TEMPERATURE_CENTI_CELSIUS: i16 = 8_500;
 const MIN_PRESSURE_PASCAL: u32 = 30_000;
 const MAX_PRESSURE_PASCAL: u32 = 110_000;
 const MAX_HUMIDITY_MILLI_PERCENT_RH: u32 = 100_000;
+// This is deliberately an allowlist: new/unknown collector flags fail closed.
+// Duplicate observations are expected while polling the BME688's three field
+// slots and are safe after deterministic terminal-step reassembly. A verified
+// pre-scan SENSOR_RECONFIGURED recovery resets temporal history but remains
+// usable because firmware read back the exact configuration before triggering
+// the scan. Every other flag, including stale pre-scan data, is critical.
+const ANALYSIS_ALLOWED_COLLECTION_FLAGS: u32 =
+    COLLECTION_FLAG_DUPLICATE | COLLECTION_FLAG_SENSOR_RECONFIGURED;
 
 /// Bitset describing why one sensor sample should not feed analysis directly.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize)]
@@ -38,6 +50,8 @@ impl QualityFlags {
     pub const HUMIDITY_OUT_OF_RANGE: Self = Self(1 << 6);
     /// Gas resistance was zero and therefore cannot be log transformed.
     pub const GAS_RESISTANCE_ZERO: Self = Self(1 << 7);
+    /// The containing profile did not pass collector/transport integrity gates.
+    pub const PROFILE_SCAN_UNUSABLE: Self = Self(1 << 8);
 
     /// Raw integer representation suitable for storage and JSON output.
     #[must_use]
@@ -56,15 +70,43 @@ impl QualityFlags {
     }
 }
 
+/// Exact sensor channel represented by an analysis sample.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum AnalysisSeries {
+    /// Legacy forced-mode v1 channel.
+    LegacyV1,
+    /// One exact heater step under one exact protocol-v2 profile definition.
+    ProfileStep {
+        /// Stable hash of the complete device/sensor/profile configuration.
+        config_id: u64,
+        /// Firmware-defined profile family.
+        profile_id: u16,
+        /// Revision of the profile family.
+        profile_version: u16,
+        /// Heater step within the profile.
+        step_index: u8,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+struct HistoryKey {
+    node_id: u64,
+    boot_id: Option<u64>,
+    series: AnalysisSeries,
+}
+
 /// Exact server-side observation before derivative calculation.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct AnalysisSample {
     /// Stable device node identity.
     pub node_id: u64,
-    /// Optional boot nonce, unavailable in protocol v1.
+    /// Optional boot nonce, unavailable in v1 or after a reported RNG failure.
     pub boot_id: Option<u64>,
     /// Sequence within the protocol stream or profile stream.
     pub sequence: u32,
+    /// Exact channel/profile identity used to isolate temporal history.
+    pub series: AnalysisSeries,
     /// Host receive time in Unix milliseconds.
     pub received_at_unix_ms: i64,
     /// Compensated temperature in hundredths of a degree Celsius.
@@ -77,6 +119,9 @@ pub struct AnalysisSample {
     pub gas_resistance_ohm: u32,
     /// Quality flags calculated before feature extraction.
     pub quality: QualityFlags,
+    /// Clear prior history for this exact series before considering this
+    /// observation. Protocol v2 sets this after verified sensor recovery.
+    pub reset_temporal_history: bool,
 }
 
 impl AnalysisSample {
@@ -92,12 +137,14 @@ impl AnalysisSample {
             node_id: frame.node_id,
             boot_id: None,
             sequence: frame.sequence,
+            series: AnalysisSeries::LegacyV1,
             received_at_unix_ms,
             temperature_centi_celsius: temperature,
             pressure_pascal: pressure,
             humidity_milli_percent_rh: humidity,
             gas_resistance_ohm: gas,
             quality: sample_quality(status.bits(), temperature, pressure, humidity, gas),
+            reset_temporal_history: false,
         }
     }
 
@@ -108,23 +155,51 @@ impl AnalysisSample {
         step: &ProfileStep,
         received_at_unix_ms: i64,
     ) -> Self {
+        let boot_id = (scan.identity.common_flags & COMMON_FLAG_BOOT_ID_VALID != 0)
+            .then_some(scan.identity.boot_id);
+        let mut quality = sample_quality(
+            step.status_bits,
+            step.temperature_centi_celsius,
+            step.pressure_pascal,
+            step.humidity_milli_percent_rh,
+            step.gas_resistance_ohm,
+        );
+        if !profile_scan_allows_analysis(scan) {
+            quality.insert(QualityFlags::PROFILE_SCAN_UNUSABLE);
+        }
         Self {
             node_id: scan.identity.node_id,
-            boot_id: Some(scan.identity.boot_id),
+            boot_id,
             sequence: scan.identity.scan_sequence,
+            series: AnalysisSeries::ProfileStep {
+                config_id: scan.identity.config_id,
+                profile_id: scan.profile_id,
+                profile_version: scan.profile_version,
+                step_index: step.step_index,
+            },
             received_at_unix_ms,
             temperature_centi_celsius: step.temperature_centi_celsius,
             pressure_pascal: step.pressure_pascal,
             humidity_milli_percent_rh: step.humidity_milli_percent_rh,
             gas_resistance_ohm: step.gas_resistance_ohm,
-            quality: sample_quality(
-                step.status_bits,
-                step.temperature_centi_celsius,
-                step.pressure_pascal,
-                step.humidity_milli_percent_rh,
-                step.gas_resistance_ohm,
-            ),
+            quality,
+            reset_temporal_history: scan.collection_flags & COLLECTION_FLAG_SENSOR_RECONFIGURED
+                != 0,
         }
+    }
+
+    fn history_key(self) -> Option<HistoryKey> {
+        // V1 has no boot nonce but remains one stable legacy channel. A v2
+        // sample with an unavailable nonce must not build history across an
+        // undetectable reboot.
+        if matches!(self.series, AnalysisSeries::ProfileStep { .. }) && self.boot_id.is_none() {
+            return None;
+        }
+        Some(HistoryKey {
+            node_id: self.node_id,
+            boot_id: self.boot_id,
+            series: self.series,
+        })
     }
 }
 
@@ -137,10 +212,14 @@ pub struct TemporalFeatures {
     pub boot_id: Option<u64>,
     /// Device sequence.
     pub sequence: u32,
+    /// Exact channel/profile identity used for this temporal series.
+    pub series: AnalysisSeries,
     /// Host receive time in Unix milliseconds.
     pub received_at_unix_ms: i64,
     /// Quality flags copied from the source sample.
     pub quality_flags: u16,
+    /// Whether this observation intentionally cleared its exact series history.
+    pub temporal_history_reset: bool,
     /// Temperature in degrees Celsius.
     pub temperature_celsius: f64,
     /// Pressure in hectopascals.
@@ -149,7 +228,7 @@ pub struct TemporalFeatures {
     pub humidity_percent_rh: f64,
     /// Natural logarithm of gas resistance in ohms, if non-zero.
     pub gas_log_ohm: Option<f64>,
-    /// Elapsed time from the prior usable sample from the same node and boot.
+    /// Elapsed time from the prior usable sample in the exact same series.
     pub elapsed_ms: Option<u64>,
     /// Temperature rate in degrees Celsius per minute.
     pub temperature_rate_celsius_per_minute: Option<f64>,
@@ -161,10 +240,11 @@ pub struct TemporalFeatures {
     pub gas_log_rate_per_minute: Option<f64>,
 }
 
-/// Stateful chronological feature extractor, isolated per node and boot.
+/// Stateful chronological feature extractor isolated by node, valid boot,
+/// profile definition, and heater step.
 #[derive(Debug, Default)]
 pub struct TemporalFeatureExtractor {
-    previous: HashMap<(u64, Option<u64>), AnalysisSample>,
+    previous: HashMap<HistoryKey, AnalysisSample>,
 }
 
 impl TemporalFeatureExtractor {
@@ -172,15 +252,24 @@ impl TemporalFeatureExtractor {
     /// gates and is newer than the prior observation.
     #[must_use]
     pub fn ingest(&mut self, sample: AnalysisSample) -> TemporalFeatures {
-        let key = (sample.node_id, sample.boot_id);
-        let previous = self.previous.get(&key).copied();
+        let key = sample.history_key();
+        let previous = match key {
+            Some(key) if sample.reset_temporal_history => {
+                self.previous.remove(&key);
+                None
+            }
+            Some(key) => self.previous.get(&key).copied(),
+            None => None,
+        };
         let current_gas_log = gas_log(sample.gas_resistance_ohm);
         let mut features = TemporalFeatures {
             node_id: sample.node_id,
             boot_id: sample.boot_id,
             sequence: sample.sequence,
+            series: sample.series,
             received_at_unix_ms: sample.received_at_unix_ms,
             quality_flags: sample.quality.bits(),
+            temporal_history_reset: sample.reset_temporal_history,
             temperature_celsius: f64::from(sample.temperature_centi_celsius) / 100.0,
             pressure_hectopascal: f64::from(sample.pressure_pascal) / 100.0,
             humidity_percent_rh: f64::from(sample.humidity_milli_percent_rh) / 1_000.0,
@@ -228,7 +317,9 @@ impl TemporalFeatureExtractor {
         if sample.quality.is_empty()
             && previous.is_none_or(|prior| sample.received_at_unix_ms > prior.received_at_unix_ms)
         {
-            self.previous.insert(key, sample);
+            if let Some(key) = key {
+                self.previous.insert(key, sample);
+            }
         }
         features
     }
@@ -239,10 +330,12 @@ impl TemporalFeatureExtractor {
 pub struct ProfileFeatures {
     /// Stable node identity.
     pub node_id: u64,
-    /// Per-boot nonce.
-    pub boot_id: u64,
+    /// Per-boot nonce, absent when the device reported RNG failure.
+    pub boot_id: Option<u64>,
     /// Profile scan sequence.
     pub sequence: u32,
+    /// Stable hash of the exact device/sensor/profile configuration.
+    pub config_id: u64,
     /// Profile identifier.
     pub profile_id: u16,
     /// Profile revision.
@@ -274,18 +367,21 @@ pub struct ProfileStepFeatures {
 /// Extract a shape-preserving gas feature vector from one profile scan.
 #[must_use]
 pub fn extract_profile_features(scan: &ProfileScan) -> ProfileFeatures {
-    let structural_valid = scan.validate().is_ok();
+    let scan_usable = profile_scan_allows_analysis(scan);
     let mut steps = scan
         .steps
         .iter()
         .map(|step| {
-            let quality = sample_quality(
+            let mut quality = sample_quality(
                 step.status_bits,
                 step.temperature_centi_celsius,
                 step.pressure_pascal,
                 step.humidity_milli_percent_rh,
                 step.gas_resistance_ohm,
             );
+            if !scan_usable {
+                quality.insert(QualityFlags::PROFILE_SCAN_UNUSABLE);
+            }
             ProfileStepFeatures {
                 step_index: step.step_index,
                 target_temperature_celsius: step.target_temperature_celsius,
@@ -312,20 +408,32 @@ pub fn extract_profile_features(scan: &ProfileScan) -> ProfileFeatures {
         }
     }
 
-    let usable = structural_valid
-        && scan.is_transport_complete()
-        && scan.computed_unavailable_steps() == 0
-        && steps.iter().all(|step| step.quality_flags == 0);
+    let usable = scan_usable && steps.iter().all(|step| step.quality_flags == 0);
     ProfileFeatures {
         node_id: scan.identity.node_id,
-        boot_id: scan.identity.boot_id,
+        boot_id: (scan.identity.common_flags & COMMON_FLAG_BOOT_ID_VALID != 0)
+            .then_some(scan.identity.boot_id),
         sequence: scan.identity.scan_sequence,
+        config_id: scan.identity.config_id,
         profile_id: scan.profile_id,
         profile_revision: scan.profile_version,
         missing_steps: scan.computed_unavailable_steps(),
         usable_for_analysis: usable,
         steps,
     }
+}
+
+fn profile_scan_allows_analysis(scan: &ProfileScan) -> bool {
+    scan.validate().is_ok()
+        && scan.is_transport_complete()
+        && scan.computed_unavailable_steps() == 0
+        && scan.finish_reason == FINISH_REASON_COMPLETE
+        && scan.collection_flags & !ANALYSIS_ALLOWED_COLLECTION_FLAGS == 0
+        && scan.overwritten_field_count == 0
+        && scan.invalid_gas_index_count == 0
+        && scan.profile_rollover_count == 0
+        && scan.fields_after_rollover_count == 0
+        && scan.conflicting_fragment_count == 0
 }
 
 fn sample_quality(
@@ -404,6 +512,48 @@ mod tests {
         }
     }
 
+    fn complete_profile_scan() -> ProfileScan {
+        ProfileScan {
+            identity: RecordIdentity {
+                common_flags: COMMON_FLAG_BOOT_ID_VALID,
+                node_id: 1,
+                boot_id: 2,
+                scan_sequence: 3,
+                uptime_ms: 4,
+                config_id: 7,
+                reset_cause_flags: 0,
+            },
+            profile_id: 5,
+            profile_version: 6,
+            expected_steps: 3,
+            observed_unique_steps: 3,
+            observed_field_count: 3,
+            reported_missing_steps: 0,
+            duplicate_steps: 0,
+            duration_us: 300_000,
+            collection_flags: 0,
+            finish_reason: FINISH_REASON_COMPLETE,
+            duplicate_count: 0,
+            overwritten_field_count: 0,
+            out_of_order_count: 0,
+            ambiguous_index_jump_count: 0,
+            invalid_gas_index_count: 0,
+            intermediate_field_count: 0,
+            profile_rollover_count: 0,
+            fields_after_rollover_count: 0,
+            poll_count: 6,
+            expected_fragment_count: 1,
+            received_fragment_bitmap: 1,
+            duplicate_fragment_count: 0,
+            conflicting_fragment_count: 0,
+            steps: vec![
+                profile_step(2, 30_000, 0xb0),
+                profile_step(0, 10_000, 0xb0),
+                profile_step(1, 20_000, 0xb0),
+            ],
+        }
+    }
+
     #[test]
     fn v1_quality_and_temporal_features_preserve_exact_units() {
         let frame = decode_hex(FIXTURE).unwrap();
@@ -449,48 +599,55 @@ mod tests {
     }
 
     #[test]
+    fn profile_temporal_history_isolated_by_step_and_profile_definition() {
+        let scan = complete_profile_scan();
+        let step_zero = scan.steps.iter().find(|step| step.step_index == 0).unwrap();
+        let step_one = scan.steps.iter().find(|step| step.step_index == 1).unwrap();
+        let mut extractor = TemporalFeatureExtractor::default();
+
+        let first = AnalysisSample::from_profile_step(&scan, step_zero, 1_000);
+        assert_eq!(extractor.ingest(first).elapsed_ms, None);
+        let other_step = AnalysisSample::from_profile_step(&scan, step_one, 61_000);
+        assert_eq!(extractor.ingest(other_step).elapsed_ms, None);
+
+        let mut other_profile = scan.clone();
+        other_profile.identity.config_id += 1;
+        other_profile.profile_version += 1;
+        let other_profile_step = other_profile
+            .steps
+            .iter()
+            .find(|step| step.step_index == 0)
+            .unwrap();
+        let changed_definition =
+            AnalysisSample::from_profile_step(&other_profile, other_profile_step, 121_000);
+        assert_eq!(extractor.ingest(changed_definition).elapsed_ms, None);
+
+        let same_series = AnalysisSample::from_profile_step(&scan, step_zero, 181_000);
+        assert_eq!(extractor.ingest(same_series).elapsed_ms, Some(180_000));
+    }
+
+    #[test]
+    fn unavailable_boot_nonce_never_builds_v2_temporal_history() {
+        let mut scan = complete_profile_scan();
+        scan.identity.common_flags &= !COMMON_FLAG_BOOT_ID_VALID;
+        scan.identity.boot_id = 0;
+        let step = scan.steps.iter().find(|step| step.step_index == 0).unwrap();
+        let first = AnalysisSample::from_profile_step(&scan, step, 1_000);
+        let second = AnalysisSample::from_profile_step(&scan, step, 61_000);
+        assert_eq!(first.boot_id, None);
+        assert_eq!(extract_profile_features(&scan).boot_id, None);
+
+        let mut extractor = TemporalFeatureExtractor::default();
+        assert_eq!(extractor.ingest(first).elapsed_ms, None);
+        assert_eq!(extractor.ingest(second).elapsed_ms, None);
+    }
+
+    #[test]
     fn profile_features_preserve_shape_and_gate_bad_steps() {
-        let scan = ProfileScan {
-            identity: RecordIdentity {
-                common_flags: 3,
-                node_id: 1,
-                boot_id: 2,
-                scan_sequence: 3,
-                uptime_ms: 4,
-                config_id: 7,
-                reset_cause_flags: 0,
-            },
-            profile_id: 5,
-            profile_version: 6,
-            expected_steps: 3,
-            observed_unique_steps: 3,
-            observed_field_count: 3,
-            reported_missing_steps: 0,
-            duplicate_steps: 0,
-            duration_us: 300_000,
-            collection_flags: 0,
-            finish_reason: 0,
-            duplicate_count: 0,
-            overwritten_field_count: 0,
-            out_of_order_count: 0,
-            ambiguous_index_jump_count: 0,
-            invalid_gas_index_count: 0,
-            intermediate_field_count: 0,
-            profile_rollover_count: 0,
-            fields_after_rollover_count: 0,
-            poll_count: 6,
-            expected_fragment_count: 1,
-            received_fragment_bitmap: 1,
-            duplicate_fragment_count: 0,
-            conflicting_fragment_count: 0,
-            steps: vec![
-                profile_step(2, 30_000, 0xb0),
-                profile_step(0, 10_000, 0xb0),
-                profile_step(1, 20_000, 0xb0),
-            ],
-        };
+        let scan = complete_profile_scan();
         let features = extract_profile_features(&scan);
         assert!(features.usable_for_analysis);
+        assert_eq!(features.config_id, scan.identity.config_id);
         assert_eq!(
             features
                 .steps
@@ -505,5 +662,85 @@ mod tests {
         let invalid_features = extract_profile_features(&invalid);
         assert!(!invalid_features.usable_for_analysis);
         assert_ne!(invalid_features.steps[0].quality_flags, 0);
+    }
+
+    #[test]
+    fn profile_analysis_rejects_noncomplete_and_collector_anomaly_scans() {
+        let complete = complete_profile_scan();
+        assert!(extract_profile_features(&complete).usable_for_analysis);
+
+        let mut noncomplete = complete.clone();
+        noncomplete.finish_reason = vesta_protocol::v2::FINISH_REASON_TIMEOUT;
+        assert!(!extract_profile_features(&noncomplete).usable_for_analysis);
+
+        for flag in [
+            vesta_protocol::v2::COLLECTION_FLAG_CONFIG_MISMATCH,
+            vesta_protocol::v2::COLLECTION_FLAG_I2C_ERROR,
+            vesta_protocol::v2::COLLECTION_FLAG_OVERWRITTEN,
+            vesta_protocol::v2::COLLECTION_FLAG_STALE_PRE_SCAN_FIELDS,
+            1 << 31,
+        ] {
+            let mut flagged = complete.clone();
+            flagged.collection_flags = flag;
+            assert!(!extract_profile_features(&flagged).usable_for_analysis);
+        }
+
+        let mut overwritten = complete.clone();
+        overwritten.overwritten_field_count = 1;
+        assert!(!extract_profile_features(&overwritten).usable_for_analysis);
+
+        let mut rollover = complete;
+        rollover.profile_rollover_count = 1;
+        assert!(!extract_profile_features(&rollover).usable_for_analysis);
+    }
+
+    #[test]
+    fn complete_terminal_profile_allows_expected_polling_duplicates() {
+        let mut scan = complete_profile_scan();
+        scan.observed_field_count = 9;
+        scan.duplicate_steps = 0b101;
+        scan.duplicate_count = 4;
+        scan.intermediate_field_count = 2;
+        scan.collection_flags = vesta_protocol::v2::COLLECTION_FLAG_DUPLICATE;
+        assert!(extract_profile_features(&scan).usable_for_analysis);
+    }
+
+    #[test]
+    fn verified_sensor_reconfiguration_resets_only_the_exact_series_history() {
+        let normal = complete_profile_scan();
+        let normal_step = normal
+            .steps
+            .iter()
+            .find(|step| step.step_index == 0)
+            .unwrap();
+        let mut extractor = TemporalFeatureExtractor::default();
+        let first = AnalysisSample::from_profile_step(&normal, normal_step, 1_000);
+        assert_eq!(extractor.ingest(first).elapsed_ms, None);
+
+        let mut recovered = normal.clone();
+        recovered.identity.scan_sequence += 1;
+        recovered.collection_flags = COLLECTION_FLAG_SENSOR_RECONFIGURED;
+        let recovered_step = recovered
+            .steps
+            .iter()
+            .find(|step| step.step_index == 0)
+            .unwrap();
+        assert!(extract_profile_features(&recovered).usable_for_analysis);
+        let recovery = AnalysisSample::from_profile_step(&recovered, recovered_step, 61_000);
+        assert!(recovery.reset_temporal_history);
+        let recovery_features = extractor.ingest(recovery);
+        assert!(recovery_features.temporal_history_reset);
+        assert_eq!(recovery_features.elapsed_ms, None);
+
+        let mut after = recovered.clone();
+        after.identity.scan_sequence += 1;
+        after.collection_flags = 0;
+        let after_step = after
+            .steps
+            .iter()
+            .find(|step| step.step_index == 0)
+            .unwrap();
+        let after_sample = AnalysisSample::from_profile_step(&after, after_step, 121_000);
+        assert_eq!(extractor.ingest(after_sample).elapsed_ms, Some(60_000));
     }
 }

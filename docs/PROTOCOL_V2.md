@@ -26,18 +26,33 @@ record, checked lengths/indices, and no panic path for malformed wire input.
 | 18 | 8 | `u64` | boot ID | fresh STM32 hardware-RNG nonce per boot |
 | 26 | 4 | `u32` | scan sequence | scan number for profiles; effective/most-recent scan for config/health |
 | 30 | 8 | `u64` | uptime | microcontroller uptime ms at scan start/snapshot creation |
-| 38 | 8 | `u64` | config ID | FNV-1a-64 over canonical `DeviceConfig` payload |
+| 38 | 8 | `u64` | config ID | nonzero FNV-1a-64 over canonical verified `DeviceConfig` payload; degraded zero sentinel rules below |
 | 46 | 2 | `u16` | reset cause | normalized flags captured before RCC flags are cleared |
 
 Common flags are `0x01=boot_id_valid`, `0x02=boot_id_from_hardware_rng`, `0x04=repeated_config`. A bounded RNG failure uses boot ID zero with both ID flags clear and reports the failure in health; it does not fabricate a nonce.
 
+Config ID zero is reserved and is never a valid `DeviceConfig` hash. A
+`ProfileFragment` may use zero only when it also reports collection flag bit 12
+(`configuration_mismatch`) and a non-complete finish reason; its nonzero
+profile ID/version still name the requested profile, while zero says the
+actual sensor-register configuration could not be verified. `DeviceHealth`
+may use config ID zero either for that explicit configuration-mismatch state,
+or before any sensor configuration has been established. In the latter case
+its profile ID and version are also zero, and `scan_sequence` counts degraded
+health attempts rather than completed profile scans. Normal verified profile
+and health records use a nonzero config ID.
+
 Reset flags are `0x0001=radio_illegal_access`, `0x0002=option_byte_loader`, `0x0004=pin`, `0x0008=brownout`, `0x0010=software`, `0x0020=independent_watchdog`, `0x0040=window_watchdog`, `0x0080=low_power`. Health also retains the exact raw 32-bit STM32WLE5 RCC CSR snapshot.
 
-`(node_id, boot_id, scan_sequence, config_id)` identifies a logical scan; adding `(frame_type, fragment_index)` identifies a frame. That supports out-of-order reassembly, duplicate detection, reboot distinction, and sequence-wrap interpretation.
+For a valid boot nonce, `(node_id, boot_id, scan_sequence, config_id)` is the nominal logical scan identity. The receiver defensively keys reassembly by `(node_id, boot_id_valid, boot_id, scan_sequence, scan_start_uptime_ms, config_id)`; adding `(frame_type, fragment_index)` identifies a frame. All fragments from one scan repeat the same scan-start uptime, so out-of-order grouping is preserved. Uptime greatly reduces collision risk when RNG failure forces the zero nonce, but it cannot prove cross-boot identity: two failed-RNG boots can begin the same sequence at the same millisecond. Such scans remain explicitly boot-ambiguous and are never used for cross-scan temporal history.
 
 ## DeviceConfig payload
 
 Length is `83 + 10 * expected_step_count`; a 10-step configuration is 183 payload bytes, 231 total.
+
+Profile ID and version are nonzero. The common-header config ID is the
+canonical payload hash and must also be nonzero; the vanishingly unlikely FNV
+zero result is rejected rather than colliding with the degraded sentinel.
 
 | Offset | Width | Type | Field | Meaning |
 | ---: | ---: | --- | --- | --- |
@@ -64,7 +79,7 @@ Length is `83 + 10 * expected_step_count`; a 10-step configuration is 183 payloa
 | 39 | 2 | `u16` | profile ID | stable profile family |
 | 41 | 2 | `u16` | profile version | increment for any profile change |
 | 43 | 1 | `u8` | expected steps | `1..10` |
-| 44 | 2 | `u16` | readback-valid bitmap | bit `n` validates IDAC/RES/GAS_WAIT bytes for descriptor `n` |
+| 44 | 2 | `u16` | readback-valid bitmap | bit `n` means all raw IDAC_HEAT/RES_HEAT/GAS_WAIT bytes for descriptor `n` were successfully read and transmitted |
 | 46 | 1 | `u8` | calibration hash algorithm | `0=none`, `1=FNV-1a-64` |
 | 47 | 8 | `u64` | calibration fingerprint | hash of exact 42 register bytes captured in Bosch block/read order, never Rust layout/reconstructed coefficients |
 | 55 | 4 | `u32` | scan interval | ms |
@@ -94,11 +109,16 @@ Each descriptor is 10 bytes:
 | 0 | 2 | `u16` | target heater temperature, °C |
 | 2 | 4 | `u32` | configured effective duration, µs |
 | 6 | 1 | `u8` | Bosch parallel TPHG repetition multiplier; zero outside parallel mode |
-| 7 | 1 | `u8` | raw `IDAC_HEATn` readback |
+| 7 | 1 | `u8` | raw `IDAC_HEATn` readback; read-only metadata, not a programmed-value comparison |
 | 8 | 1 | `u8` | raw `RES_HEATn` readback |
 | 9 | 1 | `u8` | raw `GAS_WAITn` readback |
 
 For Bosch parallel mode, `GAS_WAITn` is a repetition multiplier, not milliseconds. With multiplier `r>0`, effective duration is `r * (quantized_shared_wait_us + tphg_duration_us)`. Bosch's special zero means one TPHG and no shared wait. Carrying requested wait, raw/quantized wait, TPHG time, repetition, effective time, and raw register bytes removes ambiguity.
+
+The readback-valid bitmap is an acquisition-validity statement, not a claim
+that IDAC matched an intended programmed value. Current firmware verifies
+`RES_HEATn`, `GAS_WAITn`, shared/control registers, and the environmental
+configuration; `IDAC_HEATn` is retained as read-only metadata.
 
 ## ProfileFragment payload
 
@@ -123,14 +143,20 @@ Metadata is 42 bytes plus zero to three 47-byte steps. Total frame length is `90
 | 27 | 2 | `u16` | out-of-order count | fields arriving behind expected order |
 | 29 | 2 | `u16` | ambiguous index-jump count | index transitions not uniquely attributable |
 | 31 | 2 | `u16` | invalid gas-index count | gas index outside configured range |
-| 33 | 2 | `u16` | intermediate-field count | fields belonging to in-progress/intermediate cycles |
+| 33 | 2 | `u16` | intermediate-field count | total discarded nonterminal fields: in-scan intermediate/dummy fields plus stale `NEW_DATA` fields explicitly drained before scan start |
 | 35 | 2 | `u16` | profile-rollover count | detected complete-profile rollovers |
 | 37 | 2 | `u16` | fields-after-rollover count | extra fields seen after selected profile completed |
 | 39 | 2 | `u16` | poll count | bounded sensor field reads |
 | 41 | 1 | `u8` | step-window start | exactly `fragment_index * 3` |
 | 42 | `47*K` | steps | retained logical steps in ascending order |
 
-Collection flags: bit 0 timeout, 1 I2C error, 2 duplicate, 3 overwritten field, 4 gas index out of range, 5 measurement-index discontinuity, 6 no-new-data, 7 invalid gas, 8 heater unstable, 9 polling budget exhausted, 10 observation overflow/drop, 11 sensor reset/reconfigured mid-scan, 12 configuration mismatch.
+Collection flags: bit 0 timeout, 1 I2C error, 2 duplicate, 3 overwritten field, 4 gas index out of range, 5 measurement-index discontinuity, 6 no-new-data, 7 invalid gas, 8 heater unstable, 9 polling budget exhausted, 10 observation overflow/drop, 11 exact sensor configuration restored and read back before the scan trigger, 12 configuration mismatch, 13 stale pre-scan fields discarded. Bit 11 is not a mid-scan change: the scan still uses the configuration named by the nonzero config ID, but the server resets that exact temporal series before accepting it as a new baseline. Bit 13 requires a nonzero intermediate-field count; that count includes the stale fields but may also include normal parallel-mode dummy/intermediate observations.
+
+Before every scan, firmware verifies BME688 Sleep mode and reads/discards all
+three field slots. Every discarded slot carrying `NEW_DATA` increments the
+pre-scan stale count, is added saturating to `intermediate_field_count`, and
+sets bit 13 when nonzero. The receiver retains this evidence and conservatively
+excludes the affected scan from analysis; no wire widths or frame sizes change.
 
 Fragment windows are fixed by logical heater step: `0..2`, `3..5`, `6..8`, and `9`. Fragment count is `ceil(expected/3)` even if a complete window is missing; an empty fragment is sent. Missing observations therefore never shift later steps between packets. The encoder rejects inconsistent presence maps, counts, bitmaps, or step indices.
 
@@ -141,9 +167,9 @@ Fragment windows are fixed by logical heater step: `0..2`, `3..5`, `6..8`, and `
 | 0 | 1 | `u8` | logical step index | configured step |
 | 1 | 1 | `u8` | gas index | sensor-reported |
 | 2 | 1 | `u8` | measurement index | sensor-reported |
-| 3 | 1 | `u8` | combined status | driver status retaining known/unknown bits |
-| 4 | 1 | `u8` | raw measurement status | unmodified sensor field byte |
-| 5 | 1 | `u8` | raw gas status | unmodified sensor field byte |
+| 3 | 1 | `u8` | combined status | Bosch-compatible flags; current firmware emits only `NEW_DATA`, `GAS_VALID`, and `HEAT_STAB` |
+| 4 | 1 | `u8` | raw measurement status | unmodified BME688 `FIELDx[0]` byte |
+| 5 | 1 | `u8` | raw gas status | unmodified variant-selected BME688 `FIELDx[14]` (Gas Low) or `FIELDx[16]` (Gas High) byte |
 | 6 | 2 | `u16` | target heater temperature | °C |
 | 8 | 4 | `u32` | configured effective duration | µs |
 | 12 | 4 | `u32` | offset in scan | µs from scan-start uptime anchor |
@@ -161,7 +187,7 @@ Fragment windows are fixed by logical heater step: `0..2`, `3..5`, `6..8`, and `
 | 45 | 1 | `u8` | raw heater current/IDAC | field-associated register |
 | 46 | 1 | `u8` | raw gas wait | field-associated register |
 
-Combined known status bits remain `0x80=new_data`, `0x20=gas_valid`, `0x10=heater_stable`; unknown combined bits are `status & 0x4f`. Invalid gas/heater state does not discard a step. If bounded memory forces a canonical duplicate choice, all duplicate/overwrite counters and flags still expose the loss; it is never silent.
+Combined known status bits remain `0x80=new_data`, `0x20=gas_valid`, `0x10=heater_stable`; unknown combined bits are `status & 0x4f`. The current firmware constructs the combined byte from only those three flags, so its unknown bits are zero. They remain representable for future producers. Physical measurement/gas indices, gas range, and reserved sensor bits are retained in their dedicated fields and exact raw bytes rather than copied into the combined byte. Invalid gas/heater state does not discard a step. If bounded memory forces a canonical duplicate choice, all duplicate/overwrite counters and flags still expose the loss; it is never silent.
 
 ## DeviceHealth payload
 
@@ -191,6 +217,13 @@ Base length is 54 bytes, so the frame is 102 bytes with no internal-ADC extensio
 
 Health flags are `0x01=counters_saturated`, `0x02=boot_id_unavailable/hardware_rng_failed`, `0x04=config_mismatch`, `0x08=last_scan_incomplete`, `0x10=sensor_error_seen`, `0x20=radio_error_seen`. Unknown bits are rejected. The boot-unavailable bit must agree with the common-header boot-ID validity bit.
 
+Before sensor configuration exists, health uses config ID, profile ID, and
+profile version all zero; its sequence is a degraded health-attempt sequence.
+After a runtime configuration verification failure, health may instead retain
+the requested nonzero profile ID/version with config ID zero, but must set the
+configuration-mismatch health flag. This record remains independently
+decodable and storable; it does not depend on a `DeviceConfig` foreign key.
+
 Optional sorted, unique TLVs: `type=1,len=2,i16` is factory-calibrated MCU temperature in centi-°C; `type=2,len=2,u16` is VDD in mV using factory VREFINT calibration. They are absent until correctly implemented. VDD is not `BAT_RAW` or SOC; this PCB cannot measure battery voltage.
 
 ## Exact golden frames
@@ -216,7 +249,7 @@ Complete 10-step profile: 231, 231, 231, 137 bytes:
 5653020230030304005901020304050607081112131415161718ffffffff21222324252627289999aaaabbbbcccc00050101100100020a0a000a0000000000bc4b20000000000000000000000000000000000000000000000709090989b08030017c001531b400895440fc21000186a900009c49000027190007a129000493e94e2901fd0d0a69aa49
 ```
 
-Health without internal TLVs, 102 bytes. This fixture deliberately uses unavailable boot ID and sets every defined health flag (`0x3f`) so the degraded path is byte-covered:
+Health without internal TLVs, 102 bytes. This synthetic compatibility fixture deliberately uses unavailable boot ID and sets every defined health flag (`0x3f`) so the degraded path is byte-covered. It retains the established nonzero config ID for golden stability; operational firmware uses config ID zero for a configuration-mismatch report as specified above:
 
 ```text
 5653020330000001003601020304050607080000000000000000ffffffff21222324252627289999aaaabbbbcccc0005013f1234567800000064000000020000000300000004000000050000000600000007000000080000ea60020304100100020009000a00

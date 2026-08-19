@@ -33,6 +33,10 @@ Unsigned 64-bit node, boot, config, build, calibration, and uptime values are
 stored as fixed-width hexadecimal text where SQLite's signed integer cannot
 represent their full range. Canonical JSON records are retained alongside
 queryable columns so no less-common configuration field is lost.
+The Rust/JSON configuration field is `readback_heater_current`. The SQL column
+retains the draft schema-v2 compatibility name `programmed_heater_current` to
+avoid a destructive migration; its value is exact raw `IDAC_HEAT` readback,
+not a claim that the driver programmed IDAC.
 
 Opening schema version 1 or the prior draft schema version 2 migrates
 transactionally. Draft record tables are not rebuilt or deleted. For a schema-2
@@ -74,17 +78,35 @@ fire. Each sample carries a bitset:
 | `0x0020` | pressure was outside 300 to 1100 hPa |
 | `0x0040` | relative humidity was outside 0 to 100 percent |
 | `0x0080` | gas resistance was zero |
+| `0x0100` | containing profile failed transport or collector integrity gates |
 
 For each chronological, usable sample, `TemporalFeatureExtractor` produces:
 
 - temperature, pressure, humidity, and natural-log gas resistance;
-- elapsed time from the previous usable sample from the same node and boot;
+- elapsed time from the previous usable sample from the same node, valid boot,
+  exact configuration/profile revision, and heater step;
 - temperature, humidity, pressure, and log-gas rates per minute.
+
+An unavailable v2 boot nonce is represented as absent and is never entered in
+temporal history, because a quick reboot cannot otherwise be distinguished.
+Legacy v1 retains its separate legacy history behavior.
 
 For a heater-profile scan, `extract_profile_features` preserves the ordered
 per-step log-gas response and its offset from the scan mean. The step vector,
-profile ID, and profile revision must remain together: measurements from
-different heater programs are not directly comparable.
+config ID, profile ID, and profile revision must remain together: measurements
+from different sensor/heater definitions are not directly comparable.
+`usable_for_analysis` additionally requires a complete collector finish,
+complete transport, no missing steps, no critical collection flags or
+overwrite/index/rollover evidence, and valid status/range checks for every
+terminal step. Expected duplicate/intermediate observations from polling the
+three BME688 field slots remain diagnostics and do not alone reject a complete
+terminal profile. The explicit stale-pre-scan-fields flag is conservatively
+critical even though its discarded count shares `intermediate_field_count`;
+raw records are still retained when this gate fails. A verified pre-scan
+sensor reconfiguration remains usable because the exact configuration was read
+back before the trigger, but it clears that series' prior temporal history:
+the recovered scan becomes a fresh baseline and no derivative bridges the
+sensor reset.
 
 ## Version-2 receiver behavior
 
@@ -93,14 +115,29 @@ The implemented receiver:
 1. dispatches on magic/version and validates every v2 type, length, flag,
    fragment coordinate, config hash, step window, and optional health TLV;
 2. archives each PHY-valid packet before logical processing;
-3. reassembles profiles by `(node_id, boot_id, scan_sequence, config_id)` with
-   bounded memory, a 120-second expiry, fixed 3/3/3/1 windows, and explicit
-   duplicate/conflict/missing outcomes;
-4. persists complete profiles immediately and incomplete profiles on expiry,
+3. reassembles profiles by `(node_id, boot_id_valid, boot_id, scan_sequence,
+   scan_start_uptime_ms, config_id)` with bounded memory, a 120-second expiry,
+   fixed 3/3/3/1 windows, and explicit duplicate/conflict/missing outcomes;
+4. replays a fail-closed maximum of 1,024 archived pending fragments before
+   opening the radio, completing scans across a receiver-process restart;
+5. expires live state using monotonic elapsed time, while preserving Unix
+   receive timestamps only as source-record provenance;
+6. persists complete profiles immediately and incomplete profiles on expiry,
    capacity eviction, or graceful shutdown;
-5. keeps receiver timestamp/RSSI/SNR solely on source-fragment rows;
-6. proves v1 byte compatibility plus v2 golden, maximum, malformed,
+7. keeps receiver timestamp/RSSI/SNR solely on source-fragment rows;
+8. checks every new/replayed fragment against persisted complete scans using
+   the full logical key and exact archived payload; late duplicates/conflicts
+   update both query columns and canonical JSON, and a conflict emits a
+   machine-readable `profile_integrity_update` invalidation event;
+9. proves v1 byte compatibility plus v2 golden, maximum, malformed,
    out-of-order, duplicate, missing, and ten-step behavior in host tests.
+
+When the hardware boot nonce is unavailable, scan-start uptime reduces but
+cannot eliminate identity collisions between quick reboots; two boots could
+reach the same sequence and millisecond. Such records remain explicitly
+boot-ambiguous and are excluded from temporal history. Config ID zero is stored
+normally for pre-configuration health and explicit configuration-mismatch
+profile/health records; it has no required configuration-table foreign key.
 
 Before deployment, any v2 frames archived by an older receiver as unsupported
 still require an explicit reprocessing command; this repository does not yet

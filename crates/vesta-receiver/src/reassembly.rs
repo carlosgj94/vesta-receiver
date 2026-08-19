@@ -1,10 +1,12 @@
 //! Deterministic protocol-v2 profile-fragment reassembly.
 
 use std::collections::{HashMap, VecDeque};
+use std::time::{Duration, Instant};
 
 use serde::Serialize;
 use vesta_protocol::v2::{
-    self, COMMON_FLAG_CONFIG_REPEAT, DecodedFrame, Header, ProfileFragmentView,
+    self, COMMON_FLAG_BOOT_ID_VALID, COMMON_FLAG_CONFIG_REPEAT, DecodedFrame, Header,
+    ProfileFragmentView,
 };
 
 use crate::RadioMetadata;
@@ -20,8 +22,12 @@ pub const DEFAULT_MAX_ACTIVE_SCANS: usize = 128;
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct ProfileKey {
     pub node_id: u64,
+    /// Distinguishes a trustworthy nonce from the zero RNG-failure sentinel.
+    pub boot_id_valid: bool,
     pub boot_id: u64,
     pub scan_sequence: u32,
+    /// Scan-start uptime reduces quick-reboot ambiguity without a boot nonce.
+    pub uptime_ms: u64,
     pub config_id: u64,
 }
 
@@ -29,8 +35,10 @@ impl From<&Header> for ProfileKey {
     fn from(header: &Header) -> Self {
         Self {
             node_id: header.common.node_id,
+            boot_id_valid: header.common.flags & COMMON_FLAG_BOOT_ID_VALID != 0,
             boot_id: header.common.boot_id,
             scan_sequence: header.common.scan_sequence,
+            uptime_ms: header.common.uptime_ms,
             config_id: header.common.config_id,
         }
     }
@@ -163,11 +171,28 @@ impl ProfileReassembler {
     ///
     /// Returns an error only if extracting a step from the validated borrowed
     /// fragment unexpectedly fails.
-    #[allow(clippy::too_many_lines)]
     pub fn ingest(
         &mut self,
         fragment: ProfileFragmentView<'_>,
         source: SourceFragment,
+    ) -> Result<IngestResult, ReassemblyError> {
+        self.ingest_at(fragment, source, Instant::now())
+    }
+
+    /// Incorporate one fragment using an explicit monotonic observation time.
+    ///
+    /// This is useful for deterministic tests and startup replay. Unix receive
+    /// timestamps remain in [`SourceFragment`] solely as record provenance.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same errors as [`Self::ingest`].
+    #[allow(clippy::too_many_lines)]
+    pub fn ingest_at(
+        &mut self,
+        fragment: ProfileFragmentView<'_>,
+        source: SourceFragment,
+        observed_at: Instant,
     ) -> Result<IngestResult, ReassemblyError> {
         let owned = OwnedFragment::from_view(fragment)?;
         if source.fragment_index != owned.fragment_index {
@@ -199,7 +224,7 @@ impl ProfileReassembler {
             let oldest_key = self
                 .active
                 .iter()
-                .min_by_key(|(_, scan)| scan.last_received_at_unix_ms)
+                .min_by_key(|(_, scan)| scan.last_observed_at)
                 .map(|(key, _)| *key);
             let oldest = oldest_key.and_then(|oldest_key| self.active.remove(&oldest_key));
             if let Some(oldest) = oldest {
@@ -210,7 +235,7 @@ impl ProfileReassembler {
         let active = self
             .active
             .entry(key)
-            .or_insert_with(|| ActiveProfile::new(&owned));
+            .or_insert_with(|| ActiveProfile::new(&owned, observed_at));
         if active.metadata != owned.metadata {
             active.conflicting_fragment_count = active.conflicting_fragment_count.saturating_add(1);
             return Ok(IngestResult {
@@ -242,9 +267,7 @@ impl ProfileReassembler {
         }
 
         active.received_fragment_bitmap |= 1 << owned.fragment_index;
-        active.last_received_at_unix_ms = active
-            .last_received_at_unix_ms
-            .max(source.received_at_unix_ms);
+        active.last_observed_at = active.last_observed_at.max(observed_at);
         active.sources.push(source);
         active.fragments[fragment_index] = Some(owned);
 
@@ -254,12 +277,12 @@ impl ProfileReassembler {
                 return Err(ReassemblyError::InternalState);
             };
             let completed_fingerprints = active.fragments.clone();
-            let completed_at = active.last_received_at_unix_ms;
+            let completed_at = active.last_observed_at;
             let profile = active.finish();
             self.completed.push_back(CompletedProfile {
                 key,
                 fragments: completed_fingerprints,
-                completed_at_unix_ms: completed_at,
+                completed_at,
             });
             while self.completed.len() > self.max_active {
                 self.completed.pop_front();
@@ -280,15 +303,13 @@ impl ProfileReassembler {
         }
     }
 
-    /// Remove and return scans not updated since `cutoff_unix_ms`.
+    /// Remove and return scans not observed since a monotonic cutoff.
     #[must_use]
-    pub fn expire_before(&mut self, cutoff_unix_ms: i64) -> Vec<ReassembledProfile> {
+    pub fn expire_before(&mut self, cutoff: Instant) -> Vec<ReassembledProfile> {
         let expired_keys = self
             .active
             .iter()
-            .filter_map(|(key, scan)| {
-                (scan.last_received_at_unix_ms < cutoff_unix_ms).then_some(*key)
-            })
+            .filter_map(|(key, scan)| (scan.last_observed_at < cutoff).then_some(*key))
             .collect::<Vec<_>>();
         let mut expired = Vec::with_capacity(expired_keys.len());
         for key in expired_keys {
@@ -296,9 +317,17 @@ impl ProfileReassembler {
                 expired.push(scan.finish());
             }
         }
-        self.completed
-            .retain(|entry| entry.completed_at_unix_ms >= cutoff_unix_ms);
+        self.completed.retain(|entry| entry.completed_at >= cutoff);
         expired
+    }
+
+    /// Expire scans older than `maximum_age` using only the monotonic clock.
+    #[must_use]
+    pub fn expire_older_than(&mut self, maximum_age: Duration) -> Vec<ReassembledProfile> {
+        let Some(cutoff) = Instant::now().checked_sub(maximum_age) else {
+            return Vec::new();
+        };
+        self.expire_before(cutoff)
     }
 
     /// Drain all incomplete scans, for example during graceful shutdown.
@@ -387,11 +416,11 @@ struct ActiveProfile {
     received_fragment_bitmap: u16,
     duplicate_fragment_count: u16,
     conflicting_fragment_count: u16,
-    last_received_at_unix_ms: i64,
+    last_observed_at: Instant,
 }
 
 impl ActiveProfile {
-    fn new(fragment: &OwnedFragment) -> Self {
+    fn new(fragment: &OwnedFragment, observed_at: Instant) -> Self {
         Self {
             metadata: fragment.metadata.clone(),
             fragments: vec![None; usize::from(fragment.metadata.expected_fragment_count)],
@@ -399,7 +428,7 @@ impl ActiveProfile {
             received_fragment_bitmap: 0,
             duplicate_fragment_count: 0,
             conflicting_fragment_count: 0,
-            last_received_at_unix_ms: i64::MIN,
+            last_observed_at: observed_at,
         }
     }
 
@@ -449,7 +478,7 @@ impl ActiveProfile {
 struct CompletedProfile {
     key: ProfileKey,
     fragments: Vec<Option<OwnedFragment>>,
-    completed_at_unix_ms: i64,
+    completed_at: Instant,
 }
 
 const fn fragment_mask(fragment_count: u8) -> u16 {
@@ -481,7 +510,7 @@ pub fn device_configuration(header: Header, config: v2::DeviceConfig) -> DeviceC
             target_temperature_celsius: step.target_temperature_celsius,
             configured_duration_us: step.configured_duration_us,
             repetition_multiplier: step.repetition_multiplier,
-            programmed_heater_current: step.programmed_heater_current,
+            readback_heater_current: step.readback_heater_current,
             programmed_heater_resistance: step.programmed_heater_resistance,
             programmed_gas_wait: step.programmed_gas_wait,
         })
@@ -657,12 +686,16 @@ mod tests {
     }
 
     fn encoded_profile(sequence: u32) -> v2::EncodedProfile {
+        encoded_profile_with_common(common(sequence))
+    }
+
+    fn encoded_profile_with_common(common: v2::Common) -> v2::EncodedProfile {
         let mut steps = [None; v2::MAX_PROFILE_STEPS];
         for index in 0..10_u8 {
             steps[usize::from(index)] = Some(step(index));
         }
         v2::encode_profile(
-            common(sequence),
+            common,
             &v2::ProfileScan {
                 profile_id: 1,
                 profile_version: 1,
@@ -735,6 +768,75 @@ mod tests {
     }
 
     #[test]
+    fn unavailable_boot_quick_reboots_use_scan_uptime_as_reassembly_identity() {
+        let first = encoded_profile_with_common(v2::Common::boot_id_unavailable(1, 0, 100, 9, 2));
+        let second = encoded_profile_with_common(v2::Common::boot_id_unavailable(1, 0, 200, 9, 2));
+        let mut reassembler = ProfileReassembler::default();
+
+        let first_pending = reassembler
+            .ingest(fragment(first.frames()[0].as_slice()), source(0, 1))
+            .unwrap();
+        let second_pending = reassembler
+            .ingest(fragment(second.frames()[0].as_slice()), source(0, 2))
+            .unwrap();
+        let FragmentEvent::Pending(first_progress) = first_pending.event else {
+            panic!("expected first pending scan")
+        };
+        let FragmentEvent::Pending(second_progress) = second_pending.event else {
+            panic!("expected second pending scan")
+        };
+        assert!(!first_progress.key.boot_id_valid);
+        assert_eq!(first_progress.key.uptime_ms, 100);
+        assert_eq!(second_progress.key.uptime_ms, 200);
+        assert_ne!(first_progress.key, second_progress.key);
+        assert_eq!(reassembler.active_len(), 2);
+
+        let mut completed_uptimes = Vec::new();
+        for encoded in [&first, &second] {
+            for index in 1..4_usize {
+                let result = reassembler
+                    .ingest(
+                        fragment(encoded.frames()[index].as_slice()),
+                        source(
+                            u8::try_from(index).unwrap(),
+                            i64::try_from(index + 2).unwrap(),
+                        ),
+                    )
+                    .unwrap();
+                if let FragmentEvent::Complete(profile) = result.event {
+                    completed_uptimes.push(profile.scan.identity.uptime_ms);
+                }
+            }
+        }
+        assert_eq!(completed_uptimes, vec![100, 200]);
+        assert_eq!(reassembler.active_len(), 0);
+    }
+
+    #[test]
+    fn boot_validity_bit_is_part_of_reassembly_identity() {
+        let unavailable =
+            encoded_profile_with_common(v2::Common::boot_id_unavailable(1, 7, 100, 9, 2));
+        let valid_zero = encoded_profile_with_common(v2::Common::production(1, 0, 7, 100, 9, 2));
+        let mut reassembler = ProfileReassembler::default();
+        let unavailable_result = reassembler
+            .ingest(fragment(unavailable.frames()[0].as_slice()), source(0, 1))
+            .unwrap();
+        let valid_result = reassembler
+            .ingest(fragment(valid_zero.frames()[0].as_slice()), source(0, 2))
+            .unwrap();
+        let FragmentEvent::Pending(unavailable_progress) = unavailable_result.event else {
+            panic!("expected unavailable pending scan")
+        };
+        let FragmentEvent::Pending(valid_progress) = valid_result.event else {
+            panic!("expected valid pending scan")
+        };
+        assert!(!unavailable_progress.key.boot_id_valid);
+        assert!(valid_progress.key.boot_id_valid);
+        assert_ne!(unavailable_progress.key, valid_progress.key);
+        assert_eq!(reassembler.active_len(), 2);
+    }
+
+    #[test]
     fn detects_duplicates_before_and_after_completion() {
         let encoded = encoded_profile(2);
         let frames = encoded.frames();
@@ -796,13 +898,18 @@ mod tests {
     }
 
     #[test]
-    fn expiration_reports_missing_radio_fragments_explicitly() {
+    fn monotonic_expiration_ignores_wall_clock_and_reports_missing_fragments() {
         let encoded = encoded_profile(3);
         let mut reassembler = ProfileReassembler::default();
+        let observed_at = Instant::now();
         reassembler
-            .ingest(fragment(encoded.frames()[1].as_slice()), source(1, 100))
+            .ingest_at(
+                fragment(encoded.frames()[1].as_slice()),
+                source(1, i64::MAX),
+                observed_at,
+            )
             .unwrap();
-        let expired = reassembler.expire_before(101);
+        let expired = reassembler.expire_before(observed_at + Duration::from_millis(1));
         assert_eq!(expired.len(), 1);
         assert_eq!(expired[0].scan.received_fragment_bitmap, 0b0010);
         assert_eq!(expired[0].scan.missing_fragment_bitmap(), 0b1101);

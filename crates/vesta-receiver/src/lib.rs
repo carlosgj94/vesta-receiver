@@ -720,4 +720,41 @@ mod tests {
         assert!(human.contains("snr: -1.25 dB"));
         assert!(human.contains("signal_rssi: -102.50 dBm"));
     }
+
+    #[test]
+    fn renders_preconfiguration_health_without_a_configuration_record() {
+        let encoded = vesta_protocol::v2::encode_device_health(
+            vesta_protocol::v2::Common::boot_id_unavailable(1, 7, 12, 0, 0),
+            &vesta_protocol::v2::DeviceHealth {
+                flags: vesta_protocol::v2::HEALTH_FLAG_BOOT_ID_UNAVAILABLE,
+                reset_cause_raw: 0,
+                successful_sensor_scans: 0,
+                failed_sensor_scans: 1,
+                incomplete_profiles: 0,
+                i2c_errors: 1,
+                radio_tx_errors: 0,
+                dropped_profiles: 0,
+                dropped_fragments: 0,
+                overwritten_fields: 0,
+                current_sample_interval_ms: 180_000,
+                firmware_version: [2, 0, 0],
+                profile_id: 0,
+                profile_version: 0,
+                last_sensor_error: 1,
+                last_radio_error: 0,
+                calibrated_mcu_temperature_centi_celsius: None,
+                calibrated_vdd_millivolt: None,
+            },
+        )
+        .unwrap();
+        let decoded = vesta_protocol::v2::decode(encoded.as_slice()).unwrap();
+        let json = render_v2(decoded, OutputFormat::JsonLines, None).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(value["frame_type"], "device_health");
+        assert_eq!(value["record"]["identity"]["config_id"], "0000000000000000");
+        assert_eq!(value["record"]["profile_id"], 0);
+        assert_eq!(value["record"]["profile_version"], 0);
+        assert!(value["radio"].is_null());
+    }
 }

@@ -68,9 +68,14 @@ pub const COLLECTION_FLAG_INVALID_GAS: u32 = 1 << 7;
 pub const COLLECTION_FLAG_HEATER_UNSTABLE: u32 = 1 << 8;
 pub const COLLECTION_FLAG_POLL_BUDGET_EXHAUSTED: u32 = 1 << 9;
 pub const COLLECTION_FLAG_OBSERVATION_OVERFLOW: u32 = 1 << 10;
+/// Firmware restored and read back the exact configuration before triggering
+/// this scan. Receivers should reset temporal history, not reject the scan.
 pub const COLLECTION_FLAG_SENSOR_RECONFIGURED: u32 = 1 << 11;
 pub const COLLECTION_FLAG_CONFIG_MISMATCH: u32 = 1 << 12;
-const COLLECTION_FLAGS_KNOWN: u32 = 0x0000_1fff;
+/// One or more `NEW_DATA` fields were drained before the configured scan
+/// started. Their count is included in `intermediate_field_count`.
+pub const COLLECTION_FLAG_STALE_PRE_SCAN_FIELDS: u32 = 1 << 13;
+const COLLECTION_FLAGS_KNOWN: u32 = 0x0000_3fff;
 pub const FINISH_REASON_COMPLETE: u8 = 0;
 pub const FINISH_REASON_TIMEOUT: u8 = 1;
 pub const FINISH_REASON_SENSOR_ERROR: u8 = 2;
@@ -121,6 +126,9 @@ pub struct Common {
     /// Profile frames use the uptime at scan start. Config/health records use
     /// the uptime when that record snapshot was created.
     pub uptime_ms: u64,
+    /// Stable hash of the verified configuration. Zero is a degraded sentinel:
+    /// it is forbidden for `DeviceConfig`, and is accepted for health/profile
+    /// records only under the explicit pre-configuration/mismatch rules.
     pub config_id: u64,
     pub reset_cause_flags: u16,
 }
@@ -223,8 +231,8 @@ pub struct HeaterStepConfig {
     /// Bosch parallel-mode TPHG repetition multiplier; zero outside parallel
     /// mode (and retains Bosch's special zero semantics if ever configured).
     pub repetition_multiplier: u8,
-    /// Read-back `IDAC_HEATn` when available.
-    pub programmed_heater_current: u8,
+    /// Read-back `IDAC_HEATn`; read-only metadata, not an expected-value check.
+    pub readback_heater_current: u8,
     /// Read-back `RES_HEATn`; meaningful only when the corresponding bit in
     /// `heater_readback_valid_bitmap` is set.
     pub programmed_heater_resistance: u8,
@@ -258,6 +266,9 @@ pub struct DeviceConfig {
     pub profile_id: u16,
     pub profile_version: u16,
     pub expected_step_count: u8,
+    /// A set bit means all three raw `IDAC/RES/GAS_WAIT` descriptor bytes were
+    /// successfully read and transmitted. It does not mean IDAC matched a
+    /// programmed expectation.
     pub heater_readback_valid_bitmap: u16,
     pub calibration_hash_algorithm: u8,
     pub calibration_hash: u64,
@@ -289,8 +300,15 @@ pub struct ProfileStep {
     pub step_index: u8,
     pub gas_index: u8,
     pub measurement_index: u8,
+    /// Bosch-compatible combined flags. Current firmware emits only
+    /// `NEW_DATA` (bit 7), `GAS_VALID` (bit 5), and `HEAT_STAB` (bit 4).
+    /// Other bits remain representable for forward-compatible producers.
     pub status: u8,
+    /// Unmodified BME688 `FIELDx[0]` byte. Physical measurement-index and
+    /// reserved bits remain here instead of being folded into `status`.
     pub raw_measurement_status: u8,
+    /// Unmodified variant-selected BME688 `FIELDx[14]` (Gas Low) or
+    /// `FIELDx[16]` (Gas High) byte, including gas-index/range-adjacent bits.
     pub raw_gas_status: u8,
     pub target_temperature_celsius: u16,
     pub configured_duration_us: u32,
@@ -330,6 +348,8 @@ pub struct ProfileScan {
     pub out_of_order_count: u16,
     pub ambiguous_index_jump_count: u16,
     pub invalid_gas_index_count: u16,
+    /// Total discarded nonterminal fields: in-scan intermediate/dummy fields
+    /// plus stale `NEW_DATA` fields explicitly drained before scan start.
     pub intermediate_field_count: u16,
     pub profile_rollover_count: u16,
     pub fields_after_rollover_count: u16,
@@ -369,6 +389,8 @@ pub struct DeviceHealth {
     pub overwritten_fields: u32,
     pub current_sample_interval_ms: u32,
     pub firmware_version: [u8; 3],
+    /// Requested/current profile. Both identity fields are zero only for a
+    /// pre-configuration health attempt whose common config ID is also zero.
     pub profile_id: u16,
     pub profile_version: u16,
     pub last_sensor_error: u16,
@@ -414,6 +436,8 @@ pub struct ProfileFragmentView<'a> {
     pub out_of_order_count: u16,
     pub ambiguous_index_jump_count: u16,
     pub invalid_gas_index_count: u16,
+    /// Total discarded nonterminal fields, including stale pre-scan fields
+    /// when `COLLECTION_FLAG_STALE_PRE_SCAN_FIELDS` is set.
     pub intermediate_field_count: u16,
     pub profile_rollover_count: u16,
     pub fields_after_rollover_count: u16,
@@ -514,7 +538,11 @@ pub fn device_config_id(config: &DeviceConfig) -> Result<u64, Error> {
     let mut writer = Writer::new(&mut bytes[..payload_len]);
     write_config_payload(&mut writer, config)?;
     writer.finish()?;
-    Ok(fnv1a64(&bytes[..payload_len]))
+    let config_id = fnv1a64(&bytes[..payload_len]);
+    if config_id == 0 {
+        return Err(Error::InvalidField("reserved_config_id"));
+    }
+    Ok(config_id)
 }
 
 /// Encode all deterministic fragments for a logical profile. Logical steps
@@ -528,6 +556,7 @@ pub fn device_config_id(config: &DeviceConfig) -> Result<u64, Error> {
 /// bitmap references an impossible step, or the common header is invalid.
 pub fn encode_profile(common: Common, scan: &ProfileScan) -> Result<EncodedProfile, Error> {
     validate_profile(scan)?;
+    validate_profile_config_identity(common, scan.collection_flags, scan.finish_reason)?;
     let fragment_count = profile_fragment_count(scan.expected_step_count)?;
     let mut output = EncodedProfile {
         frames: [EncodedFrame::EMPTY; MAX_PROFILE_FRAGMENTS],
@@ -602,6 +631,7 @@ pub fn encode_profile(common: Common, scan: &ProfileScan) -> Result<EncodedProfi
 /// record cannot fit in one PHY packet.
 pub fn encode_device_health(common: Common, health: &DeviceHealth) -> Result<EncodedFrame, Error> {
     validate_health_flags(common, health.flags)?;
+    validate_health_config_identity(common, health)?;
     let extension_len = usize::from(health.calibrated_mcu_temperature_centi_celsius.is_some()) * 4
         + usize::from(health.calibrated_vdd_millivolt.is_some()) * 4;
     let payload_len = HEALTH_BASE_LEN + extension_len;
@@ -759,6 +789,9 @@ fn validate_config(config: &DeviceConfig) -> Result<(), Error> {
     if config.output_routes == 0 {
         return Err(Error::InvalidField("output_routes"));
     }
+    if config.profile_id == 0 || config.profile_version == 0 {
+        return Err(Error::InvalidField("profile_identity"));
+    }
     if !(1..=MAX_PROFILE_STEPS_U8).contains(&config.expected_step_count) {
         return Err(Error::InvalidField("expected_step_count"));
     }
@@ -796,7 +829,7 @@ fn validate_config(config: &DeviceConfig) -> Result<(), Error> {
         }
         if index < usize::from(config.expected_step_count)
             && config.heater_readback_valid_bitmap & (1 << index) == 0
-            && (step.programmed_heater_current != 0
+            && (step.readback_heater_current != 0
                 || step.programmed_heater_resistance != 0
                 || step.programmed_gas_wait != 0)
         {
@@ -807,6 +840,9 @@ fn validate_config(config: &DeviceConfig) -> Result<(), Error> {
 }
 
 fn validate_profile(scan: &ProfileScan) -> Result<(), Error> {
+    if scan.profile_id == 0 || scan.profile_version == 0 {
+        return Err(Error::InvalidField("profile_identity"));
+    }
     if !(1..=MAX_PROFILE_STEPS_U8).contains(&scan.expected_step_count) {
         return Err(Error::InvalidField("expected_step_count"));
     }
@@ -817,6 +853,11 @@ fn validate_profile(scan: &ProfileScan) -> Result<(), Error> {
     )?;
     if scan.finish_reason > FINISH_REASON_PROFILE_ROLLOVER {
         return Err(Error::InvalidField("finish_reason"));
+    }
+    if scan.collection_flags & COLLECTION_FLAG_STALE_PRE_SCAN_FIELDS != 0
+        && scan.intermediate_field_count == 0
+    {
+        return Err(Error::InvalidField("stale_pre_scan_fields"));
     }
     let valid_mask = step_mask(scan.expected_step_count);
     if scan.missing_steps_bitmap & !valid_mask != 0
@@ -841,6 +882,20 @@ fn validate_profile(scan: &ProfileScan) -> Result<(), Error> {
             (false, None) => {}
             _ => return Err(Error::InvalidField("profile_step_presence")),
         }
+    }
+    Ok(())
+}
+
+fn validate_profile_config_identity(
+    common: Common,
+    collection_flags: u32,
+    finish_reason: u8,
+) -> Result<(), Error> {
+    if common.config_id == 0
+        && (collection_flags & COLLECTION_FLAG_CONFIG_MISMATCH == 0
+            || finish_reason == FINISH_REASON_COMPLETE)
+    {
+        return Err(Error::InvalidField("profile_config_id_status"));
     }
     Ok(())
 }
@@ -899,7 +954,7 @@ fn write_config_payload(writer: &mut Writer<'_>, config: &DeviceConfig) -> Resul
         writer.u16(step.target_temperature_celsius)?;
         writer.u32(step.configured_duration_us)?;
         writer.u8(step.repetition_multiplier)?;
-        writer.u8(step.programmed_heater_current)?;
+        writer.u8(step.readback_heater_current)?;
         writer.u8(step.programmed_heater_resistance)?;
         writer.u8(step.programmed_gas_wait)?;
     }
@@ -1130,6 +1185,9 @@ fn validate_decoded_config(header: Header, payload: &[u8]) -> Result<(), Error> 
     }
     ensure_known_u8("config_flags", payload[1], CONFIG_FLAGS_KNOWN)?;
     ensure_known_u8("firmware_build_flags", payload[5], BUILD_FLAGS_KNOWN)?;
+    if header.common.config_id == 0 {
+        return Err(Error::InvalidField("reserved_config_id"));
+    }
     let calculated = fnv1a64(payload);
     if calculated != header.common.config_id {
         return Err(Error::ConfigIdMismatch {
@@ -1194,7 +1252,7 @@ fn decode_device_config(header: Header, payload: &[u8]) -> Result<DeviceConfig, 
             target_temperature_celsius: reader.u16()?,
             configured_duration_us: reader.u32()?,
             repetition_multiplier: reader.u8()?,
-            programmed_heater_current: reader.u8()?,
+            readback_heater_current: reader.u8()?,
             programmed_heater_resistance: reader.u8()?,
             programmed_gas_wait: reader.u8()?,
         };
@@ -1289,8 +1347,17 @@ fn decode_profile_fragment(
         return Err(Error::InvalidField("expected_step_count"));
     }
     ensure_known_u32("collection_flags", collection_flags, COLLECTION_FLAGS_KNOWN)?;
+    if profile_id == 0 || profile_version == 0 {
+        return Err(Error::InvalidField("profile_identity"));
+    }
+    validate_profile_config_identity(header.common, collection_flags, finish_reason)?;
     if finish_reason > FINISH_REASON_PROFILE_ROLLOVER {
         return Err(Error::InvalidField("finish_reason"));
+    }
+    if collection_flags & COLLECTION_FLAG_STALE_PRE_SCAN_FIELDS != 0
+        && intermediate_field_count == 0
+    {
+        return Err(Error::InvalidField("stale_pre_scan_fields"));
     }
     let required_fragment_count = profile_fragment_count(expected_step_count)?;
     if header.fragment_count != required_fragment_count {
@@ -1432,6 +1499,24 @@ fn validate_health_flags(common: Common, flags: u8) -> Result<(), Error> {
     Ok(())
 }
 
+fn validate_health_config_identity(common: Common, health: &DeviceHealth) -> Result<(), Error> {
+    let profile_id_missing = health.profile_id == 0;
+    let profile_version_missing = health.profile_version == 0;
+    if profile_id_missing != profile_version_missing {
+        return Err(Error::InvalidField("health_profile_identity"));
+    }
+    if profile_id_missing {
+        if common.config_id != 0 {
+            return Err(Error::InvalidField("health_config_id_status"));
+        }
+        return Ok(());
+    }
+    if common.config_id == 0 && health.flags & HEALTH_FLAG_CONFIG_MISMATCH == 0 {
+        return Err(Error::InvalidField("health_config_id_status"));
+    }
+    Ok(())
+}
+
 fn decode_device_health(header: Header, payload: &[u8]) -> Result<DeviceHealth, Error> {
     validate_decoded_health(header, payload)?;
     let mut reader = Reader::new(&payload[..HEALTH_BASE_LEN]);
@@ -1476,7 +1561,7 @@ fn decode_device_health(header: Header, payload: &[u8]) -> Result<DeviceHealth, 
         }
     }
     extensions.finish()?;
-    Ok(DeviceHealth {
+    let health = DeviceHealth {
         flags,
         reset_cause_raw,
         successful_sensor_scans,
@@ -1495,7 +1580,9 @@ fn decode_device_health(header: Header, payload: &[u8]) -> Result<DeviceHealth, 
         last_radio_error,
         calibrated_mcu_temperature_centi_celsius,
         calibrated_vdd_millivolt,
-    })
+    };
+    validate_health_config_identity(header.common, &health)?;
+    Ok(health)
 }
 
 const fn step_mask(step_count: u8) -> u16 {
@@ -1689,7 +1776,7 @@ mod tests {
                 target_temperature_celsius: 200 + u16::try_from(index).unwrap() * 20,
                 configured_duration_us: 138_898 * (u32::try_from(index).unwrap() + 1),
                 repetition_multiplier: u8::try_from(index).unwrap() + 1,
-                programmed_heater_current: 0x20 + u8::try_from(index).unwrap(),
+                readback_heater_current: 0x20 + u8::try_from(index).unwrap(),
                 programmed_heater_resistance: 0x60 + u8::try_from(index).unwrap(),
                 programmed_gas_wait: 0x40 + u8::try_from(index).unwrap(),
             };
@@ -1873,6 +1960,41 @@ mod tests {
         assert_eq!(last.steps_in_fragment, 1);
         assert_eq!(last.step(0).unwrap().step_index, 9);
         assert_eq!(last.missing_steps_bitmap, (1 << 1) | (1 << 8));
+    }
+
+    #[test]
+    fn stale_pre_scan_fields_are_counted_and_flagged_without_changing_layout() {
+        let mut scan = complete_scan();
+        scan.observed_field_count = 15;
+        scan.intermediate_field_count = 5;
+        scan.collection_flags = COLLECTION_FLAG_STALE_PRE_SCAN_FIELDS;
+
+        let encoded = encode_profile(common(7), &scan).unwrap();
+        assert_eq!(encoded.frames()[0].len(), MAX_PROFILE_FRAME_LEN);
+        for frame in encoded.frames() {
+            let DecodedFrame::ProfileFragment(fragment) = decode(frame.as_slice()).unwrap() else {
+                panic!("wrong record type");
+            };
+            assert_eq!(fragment.intermediate_field_count, 5);
+            assert_eq!(
+                fragment.collection_flags,
+                COLLECTION_FLAG_STALE_PRE_SCAN_FIELDS
+            );
+        }
+
+        let mut invalid_scan = scan;
+        invalid_scan.intermediate_field_count = 0;
+        assert_eq!(
+            encode_profile(common(7), &invalid_scan),
+            Err(Error::InvalidField("stale_pre_scan_fields"))
+        );
+
+        let mut malformed = encoded.frames()[0];
+        malformed.bytes[HEADER_LEN + 33..HEADER_LEN + 35].fill(0);
+        assert_eq!(
+            decode(malformed.as_slice()),
+            Err(Error::InvalidField("stale_pre_scan_fields"))
+        );
     }
 
     #[test]
@@ -2076,6 +2198,106 @@ mod tests {
                 bits: 0x80
             })
         ));
+    }
+
+    #[test]
+    fn zero_config_id_is_reserved_for_degraded_health_or_mismatch_profiles() {
+        let normal_health = DeviceHealth {
+            flags: 0,
+            reset_cause_raw: 0,
+            successful_sensor_scans: 0,
+            failed_sensor_scans: 1,
+            incomplete_profiles: 1,
+            i2c_errors: 0,
+            radio_tx_errors: 0,
+            dropped_profiles: 0,
+            dropped_fragments: 0,
+            overwritten_fields: 0,
+            current_sample_interval_ms: 180_000,
+            firmware_version: [2, 0, 0],
+            profile_id: 0x1001,
+            profile_version: 2,
+            last_sensor_error: 1,
+            last_radio_error: 0,
+            calibrated_mcu_temperature_centi_celsius: None,
+            calibrated_vdd_millivolt: None,
+        };
+
+        assert_eq!(
+            encode_device_health(common(0), &normal_health),
+            Err(Error::InvalidField("health_config_id_status"))
+        );
+        let pre_config = DeviceHealth {
+            profile_id: 0,
+            profile_version: 0,
+            ..normal_health
+        };
+        let pre_config_frame = encode_device_health(common(0), &pre_config).unwrap();
+        let DecodedFrame::DeviceHealth {
+            header,
+            health: decoded_pre_config,
+        } = decode(pre_config_frame.as_slice()).unwrap()
+        else {
+            panic!("wrong record type")
+        };
+        assert_eq!(header.common.config_id, 0);
+        assert_eq!(decoded_pre_config.profile_id, 0);
+        assert_eq!(decoded_pre_config.profile_version, 0);
+
+        let mismatch_health = DeviceHealth {
+            flags: HEALTH_FLAG_CONFIG_MISMATCH,
+            ..normal_health
+        };
+        let mismatch_health_frame = encode_device_health(common(0), &mismatch_health).unwrap();
+        let DecodedFrame::DeviceHealth {
+            header,
+            health: decoded_mismatch_health,
+        } = decode(mismatch_health_frame.as_slice()).unwrap()
+        else {
+            panic!("wrong record type")
+        };
+        assert_eq!(header.common.config_id, 0);
+        assert_eq!(decoded_mismatch_health.profile_id, normal_health.profile_id);
+
+        let mut malformed_normal_health = encode_device_health(common(7), &normal_health).unwrap();
+        malformed_normal_health.bytes[38..46].fill(0);
+        assert_eq!(
+            decode(malformed_normal_health.as_slice()),
+            Err(Error::InvalidField("health_config_id_status"))
+        );
+
+        assert_eq!(
+            encode_profile(common(0), &complete_scan()),
+            Err(Error::InvalidField("profile_config_id_status"))
+        );
+        let mut mismatch_scan = complete_scan();
+        mismatch_scan.collection_flags = COLLECTION_FLAG_CONFIG_MISMATCH;
+        mismatch_scan.finish_reason = FINISH_REASON_SENSOR_ERROR;
+        let mismatch_profile = encode_profile(common(0), &mismatch_scan).unwrap();
+        let DecodedFrame::ProfileFragment(decoded_mismatch) =
+            decode(mismatch_profile.frames()[0].as_slice()).unwrap()
+        else {
+            panic!("wrong record type")
+        };
+        assert_eq!(decoded_mismatch.header.common.config_id, 0);
+        assert_eq!(decoded_mismatch.profile_id, mismatch_scan.profile_id);
+        assert_eq!(
+            decoded_mismatch.profile_version,
+            mismatch_scan.profile_version
+        );
+
+        let mut zero_profile = config();
+        zero_profile.profile_id = 0;
+        assert_eq!(
+            encode_device_config(common(1), &zero_profile, false),
+            Err(Error::InvalidField("profile_identity"))
+        );
+        let mut config_frame = encode_device_config(common(1), &config(), false).unwrap();
+        config_frame.bytes[38..46].fill(0);
+        assert_eq!(
+            decode(config_frame.as_slice()),
+            Err(Error::InvalidField("reserved_config_id"))
+        );
     }
 
     #[test]

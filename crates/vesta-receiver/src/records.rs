@@ -30,7 +30,8 @@ pub struct HeaterStepConfiguration {
     pub target_temperature_celsius: u16,
     pub configured_duration_us: u32,
     pub repetition_multiplier: u8,
-    pub programmed_heater_current: u8,
+    /// Exact raw `IDAC_HEAT` readback; IDAC is not programmed by this driver.
+    pub readback_heater_current: u8,
     pub programmed_heater_resistance: u8,
     pub programmed_gas_wait: u8,
 }
@@ -128,8 +129,12 @@ pub struct ProfileStep {
     pub step_index: u8,
     pub gas_index: u8,
     pub measurement_index: u8,
+    /// Bosch-compatible combined flags; current firmware emits only
+    /// `NEW_DATA/GAS_VALID/HEAT_STAB`.
     pub status_bits: u8,
+    /// Exact BME688 `FIELDx[0]` byte.
     pub raw_measurement_status: u8,
+    /// Exact variant-selected BME688 `FIELDx[14]`/`FIELDx[16]` byte.
     pub raw_gas_status: u8,
     pub target_temperature_celsius: u16,
     pub configured_duration_us: u32,

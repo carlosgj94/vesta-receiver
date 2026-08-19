@@ -11,11 +11,17 @@ use vesta_protocol::v2::Header;
 use vesta_protocol::{TelemetryV1, VERSION};
 
 use crate::RadioMetadata;
-use crate::reassembly::ReassembledProfile;
+use crate::reassembly::{ProfileKey, ReassembledProfile};
 use crate::records::{DeviceConfiguration, DeviceHealth, RecordError};
 
 const SCHEMA_VERSION: i64 = 3;
 const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
+const PROFILE_REASSEMBLY_INDEX: &str = r"
+CREATE INDEX IF NOT EXISTS v2_profile_reassembly_identity
+    ON v2_profile_scans(
+        node_id, boot_id, scan_sequence, uptime_ms, config_id, common_flags
+    );
+";
 
 const SCHEMA_V1: &str = r"
 CREATE TABLE IF NOT EXISTS telemetry_readings (
@@ -174,6 +180,8 @@ CREATE TABLE IF NOT EXISTS v2_heater_profile_steps (
     target_temperature_celsius INTEGER NOT NULL,
     configured_duration_us INTEGER NOT NULL,
     repetition_multiplier INTEGER NOT NULL,
+    -- Draft schema-v2 compatibility identifier; this stores exact raw IDAC_HEAT
+    -- readback and does not claim that the driver programmed IDAC.
     programmed_heater_current INTEGER NOT NULL,
     programmed_heater_resistance INTEGER NOT NULL,
     programmed_gas_wait INTEGER NOT NULL,
@@ -222,7 +230,6 @@ CREATE INDEX IF NOT EXISTS v2_profile_node_received
     ON v2_profile_scans(node_id, last_received_at_unix_ms DESC);
 CREATE INDEX IF NOT EXISTS v2_profile_identity
     ON v2_profile_scans(node_id, boot_id, scan_sequence, config_id);
-
 CREATE TABLE IF NOT EXISTS v2_profile_steps (
     scan_id INTEGER NOT NULL REFERENCES v2_profile_scans(id) ON DELETE CASCADE,
     step_index INTEGER NOT NULL CHECK (step_index BETWEEN 0 AND 9),
@@ -317,6 +324,15 @@ pub struct StoredPacket {
     pub received_at_unix_ms: i64,
 }
 
+/// One previously archived profile fragment awaiting startup reconciliation.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PendingProfileFragment {
+    pub packet_id: i64,
+    pub received_at_unix_ms: i64,
+    pub radio: RadioMetadata,
+    pub payload: Vec<u8>,
+}
+
 /// Identity assigned to one logical protocol-v2 record.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct StoredRecord {
@@ -383,6 +399,24 @@ pub enum FragmentStorageStatus {
     Incomplete,
 }
 
+/// A newly archived fragment matched an already persisted complete profile.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PersistedFragmentMatch {
+    /// Its exact payload matches the persisted fragment at this index.
+    Duplicate,
+    /// Its payload differs from at least one persisted fragment at this index.
+    Conflict,
+}
+
+impl PersistedFragmentMatch {
+    const fn storage_status(self) -> FragmentStorageStatus {
+        match self {
+            Self::Duplicate => FragmentStorageStatus::Duplicate,
+            Self::Conflict => FragmentStorageStatus::Conflict,
+        }
+    }
+}
+
 impl FragmentStorageStatus {
     const fn database_value(self) -> &'static str {
         match self {
@@ -440,6 +474,9 @@ impl TelemetryStore {
             SCHEMA_VERSION => {}
             found => return Err(StorageError::UnsupportedSchemaVersion { found }),
         }
+        // Schema-v3 databases may predate durable completed-profile checks.
+        // Add the supporting index non-destructively without a version bump.
+        connection.execute_batch(PROFILE_REASSEMBLY_INDEX)?;
         Ok(Self { connection })
     }
 
@@ -575,6 +612,161 @@ impl TelemetryStore {
         Ok(packet)
     }
 
+    /// Load every archived profile fragment still marked pending, up to a hard
+    /// startup bound.
+    ///
+    /// The count is checked before any payload is returned, so callers never
+    /// reconcile a silent prefix while abandoning the remainder.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for a zero/unrepresentable bound, an exceeded bound,
+    /// or an `SQLite` query failure.
+    pub fn pending_profile_fragments(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<PendingProfileFragment>, StorageError> {
+        let limit_usize = limit;
+        let limit = i64::try_from(limit_usize)
+            .ok()
+            .filter(|limit| *limit > 0)
+            .ok_or(StorageError::InvalidPendingReplayLimit)?;
+        let pending: i64 = self.connection.query_row(
+            "SELECT count(*)
+             FROM radio_packets AS packet
+             JOIN v2_packet_decodes AS decoded ON decoded.packet_id = packet.id
+             WHERE decoded.record_kind = 'profile_fragment'
+               AND decoded.reassembly_status = 'pending'",
+            [],
+            |row| row.get(0),
+        )?;
+        if pending > limit {
+            return Err(StorageError::PendingReplayLimitExceeded {
+                pending,
+                limit: limit_usize,
+            });
+        }
+
+        let mut statement = self.connection.prepare(
+            "SELECT packet.id, packet.received_at_unix_ms,
+                    packet.packet_rssi_centi_dbm, packet.snr_centi_db,
+                    packet.signal_rssi_centi_dbm, packet.payload
+             FROM radio_packets AS packet
+             JOIN v2_packet_decodes AS decoded ON decoded.packet_id = packet.id
+             WHERE decoded.record_kind = 'profile_fragment'
+               AND decoded.reassembly_status = 'pending'
+             ORDER BY packet.id ASC
+             LIMIT ?1",
+        )?;
+        let fragments = statement
+            .query_map([limit], |row| {
+                Ok(PendingProfileFragment {
+                    packet_id: row.get(0)?,
+                    received_at_unix_ms: row.get(1)?,
+                    radio: RadioMetadata {
+                        packet_rssi_centi_dbm: row.get(2)?,
+                        snr_centi_db: row.get(3)?,
+                        signal_rssi_centi_dbm: row.get(4)?,
+                    },
+                    payload: row.get(5)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(fragments)
+    }
+
+    /// Classify a fragment against any already persisted complete profile with
+    /// the same full logical key.
+    ///
+    /// A match updates the new packet's reassembly disposition and saturating
+    /// duplicate/conflict counters on every matching persisted scan. Conflict
+    /// updates also make those scans fail the analysis integrity gate. This
+    /// durable check survives receiver restarts and completed-cache expiry.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an `SQLite` query/update or commit failure.
+    pub fn reconcile_completed_profile_fragment(
+        &mut self,
+        key: ProfileKey,
+        packet_id: i64,
+        fragment_index: u8,
+        payload: &[u8],
+    ) -> Result<Option<PersistedFragmentMatch>, StorageError> {
+        let transaction = self.connection.transaction()?;
+        let persisted = {
+            let mut statement = transaction.prepare(
+                "SELECT scan.id, packet.payload
+                 FROM v2_profile_scans AS scan
+                 JOIN v2_profile_fragments AS fragment
+                   ON fragment.scan_id = scan.id
+                  AND fragment.fragment_index = ?7
+                 JOIN radio_packets AS packet ON packet.id = fragment.packet_id
+                 WHERE scan.node_id = ?1
+                   AND scan.boot_id = ?2
+                   AND scan.scan_sequence = ?3
+                   AND scan.uptime_ms = ?4
+                   AND scan.config_id = ?5
+                   AND ((scan.common_flags & 1) != 0) = ?6
+                   AND scan.transport_complete = 1
+                 ORDER BY scan.id ASC",
+            )?;
+            statement
+                .query_map(
+                    params![
+                        hex_u64(key.node_id),
+                        hex_u64(key.boot_id),
+                        key.scan_sequence,
+                        hex_u64(key.uptime_ms),
+                        hex_u64(key.config_id),
+                        i64::from(key.boot_id_valid),
+                        fragment_index,
+                    ],
+                    |row| Ok((row.get::<_, i64>(0)?, row.get::<_, Vec<u8>>(1)?)),
+                )?
+                .collect::<Result<Vec<_>, _>>()?
+        };
+        if persisted.is_empty() {
+            transaction.commit()?;
+            return Ok(None);
+        }
+
+        let classification = if persisted
+            .iter()
+            .all(|(_, persisted_payload)| persisted_payload == payload)
+        {
+            PersistedFragmentMatch::Duplicate
+        } else {
+            PersistedFragmentMatch::Conflict
+        };
+        let (column, json_path) = match classification {
+            PersistedFragmentMatch::Duplicate => {
+                ("duplicate_fragment_count", "$.duplicate_fragment_count")
+            }
+            PersistedFragmentMatch::Conflict => {
+                ("conflicting_fragment_count", "$.conflicting_fragment_count")
+            }
+        };
+        let update = format!(
+            "UPDATE v2_profile_scans
+             SET {column} = min({column} + 1, 65535),
+                 record_json = json_set(
+                     record_json, '{json_path}', min({column} + 1, 65535)
+                 )
+             WHERE id = ?1"
+        );
+        for (scan_id, _) in &persisted {
+            transaction.execute(&update, [scan_id])?;
+        }
+        transaction.execute(
+            "UPDATE v2_packet_decodes SET reassembly_status = ?1
+             WHERE packet_id = ?2",
+            params![classification.storage_status().database_value(), packet_id],
+        )?;
+        transaction.commit()?;
+        Ok(Some(classification))
+    }
+
     /// Update receiver-side reassembly state for an archived fragment.
     ///
     /// # Errors
@@ -673,7 +865,7 @@ impl TelemetryStore {
                     step.target_temperature_celsius,
                     step.configured_duration_us,
                     step.repetition_multiplier,
-                    step.programmed_heater_current,
+                    step.readback_heater_current,
                     step.programmed_heater_resistance,
                     step.programmed_gas_wait,
                 ],
@@ -1089,6 +1281,8 @@ pub enum StorageError {
     InvalidRecord(RecordError),
     MissingV2Packet { packet_id: i64 },
     ProfileWithoutFragments,
+    InvalidPendingReplayLimit,
+    PendingReplayLimitExceeded { pending: i64, limit: usize },
     MigrationForeignKeyViolations { count: i64 },
     UnsupportedSchemaVersion { found: i64 },
 }
@@ -1108,6 +1302,13 @@ impl fmt::Display for StorageError {
             Self::ProfileWithoutFragments => {
                 formatter.write_str("reassembled profile has no source fragments")
             }
+            Self::InvalidPendingReplayLimit => {
+                formatter.write_str("pending-fragment replay limit must be positive")
+            }
+            Self::PendingReplayLimitExceeded { pending, limit } => write!(
+                formatter,
+                "{pending} pending profile fragments exceed startup replay limit {limit}"
+            ),
             Self::MigrationForeignKeyViolations { count } => write!(
                 formatter,
                 "schema migration left {count} foreign-key violation(s)"
@@ -1131,6 +1332,8 @@ impl std::error::Error for StorageError {
             Self::TimestampOutOfRange
             | Self::MissingV2Packet { .. }
             | Self::ProfileWithoutFragments
+            | Self::InvalidPendingReplayLimit
+            | Self::PendingReplayLimitExceeded { .. }
             | Self::MigrationForeignKeyViolations { .. }
             | Self::UnsupportedSchemaVersion { .. } => None,
         }
@@ -1171,7 +1374,7 @@ impl From<RecordError> for StorageError {
 mod tests {
     use super::*;
     use crate::reassembly::{
-        FragmentEvent, ProfileReassembler, SourceFragment, device_configuration,
+        FragmentEvent, ProfileReassembler, SourceFragment, device_configuration, device_health,
     };
     use crate::{decode_hex, parse_frame_hex, parse_payload_hex};
 
@@ -1219,6 +1422,71 @@ mod tests {
             )
             .unwrap();
         assert_eq!(archived, payload);
+    }
+
+    #[test]
+    fn stores_preconfiguration_health_with_zero_config_id_as_protocol_v2() {
+        let mut store = TelemetryStore::open_in_memory().unwrap();
+        let common = vesta_protocol::v2::Common::boot_id_unavailable(1, 7, 12, 0, 0);
+        let encoded = vesta_protocol::v2::encode_device_health(
+            common,
+            &vesta_protocol::v2::DeviceHealth {
+                flags: vesta_protocol::v2::HEALTH_FLAG_BOOT_ID_UNAVAILABLE,
+                reset_cause_raw: 0,
+                successful_sensor_scans: 0,
+                failed_sensor_scans: 1,
+                incomplete_profiles: 0,
+                i2c_errors: 1,
+                radio_tx_errors: 0,
+                dropped_profiles: 0,
+                dropped_fragments: 0,
+                overwritten_fields: 0,
+                current_sample_interval_ms: 180_000,
+                firmware_version: [2, 0, 0],
+                profile_id: 0,
+                profile_version: 0,
+                last_sensor_error: 1,
+                last_radio_error: 0,
+                calibrated_mcu_temperature_centi_celsius: None,
+                calibrated_vdd_millivolt: None,
+            },
+        )
+        .unwrap();
+        let vesta_protocol::v2::DecodedFrame::DeviceHealth { header, health } =
+            vesta_protocol::v2::decode(encoded.as_slice()).unwrap()
+        else {
+            unreachable!()
+        };
+        let packet = store
+            .archive_v2_packet(
+                encoded.as_slice(),
+                radio(),
+                header,
+                V2PacketKind::DeviceHealth,
+            )
+            .unwrap();
+        store
+            .insert_device_health(&device_health(header, health), Some(packet.id))
+            .unwrap();
+
+        let row: (String, String, i64, i64) = store
+            .connection
+            .query_row(
+                "SELECT p.disposition, h.config_id, h.profile_id, h.profile_version
+                 FROM v2_device_health AS h
+                 JOIN radio_packets AS p ON p.id = h.source_packet_id",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(row, ("v2".to_owned(), "0000000000000000".to_owned(), 0, 0));
+        let foreign_key_violations: i64 = store
+            .connection
+            .query_row("SELECT count(*) FROM pragma_foreign_key_check", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(foreign_key_violations, 0);
     }
 
     fn protocol_step(index: u8) -> vesta_protocol::v2::ProfileStep {
@@ -1405,6 +1673,128 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
+    fn persisted_profile_detects_late_duplicate_and_conflict_without_cache() {
+        let mut store = TelemetryStore::open_in_memory().unwrap();
+        let encoded = protocol_profile(11);
+        let mut reassembler = ProfileReassembler::default();
+        let mut completed = None;
+        for (index, frame) in encoded.frames().iter().enumerate() {
+            let vesta_protocol::v2::DecodedFrame::ProfileFragment(fragment) =
+                vesta_protocol::v2::decode(frame.as_slice()).unwrap()
+            else {
+                unreachable!()
+            };
+            let packet = store
+                .archive_v2_packet(
+                    frame.as_slice(),
+                    radio(),
+                    fragment.header,
+                    V2PacketKind::ProfileFragment,
+                )
+                .unwrap();
+            let result = reassembler
+                .ingest(
+                    fragment,
+                    SourceFragment {
+                        packet_id: packet.id,
+                        fragment_index: u8::try_from(index).unwrap(),
+                        received_at_unix_ms: packet.received_at_unix_ms,
+                        radio: radio(),
+                    },
+                )
+                .unwrap();
+            if let FragmentEvent::Complete(profile) = result.event {
+                completed = Some(profile);
+            }
+        }
+        store.insert_profile_scan(&completed.unwrap()).unwrap();
+        drop(reassembler);
+
+        let duplicate_payload = encoded.frames()[0].as_slice();
+        let vesta_protocol::v2::DecodedFrame::ProfileFragment(duplicate) =
+            vesta_protocol::v2::decode(duplicate_payload).unwrap()
+        else {
+            unreachable!()
+        };
+        let duplicate_packet = store
+            .archive_v2_packet(
+                duplicate_payload,
+                radio(),
+                duplicate.header,
+                V2PacketKind::ProfileFragment,
+            )
+            .unwrap();
+        let key = ProfileKey::from(&duplicate.header);
+        assert_eq!(
+            store
+                .reconcile_completed_profile_fragment(
+                    key,
+                    duplicate_packet.id,
+                    0,
+                    duplicate_payload,
+                )
+                .unwrap(),
+            Some(PersistedFragmentMatch::Duplicate)
+        );
+
+        let mut conflict_payload = duplicate_payload.to_vec();
+        let last = conflict_payload.len() - 1;
+        conflict_payload[last] ^= 1;
+        let vesta_protocol::v2::DecodedFrame::ProfileFragment(conflict) =
+            vesta_protocol::v2::decode(&conflict_payload).unwrap()
+        else {
+            unreachable!()
+        };
+        let conflict_packet = store
+            .archive_v2_packet(
+                &conflict_payload,
+                radio(),
+                conflict.header,
+                V2PacketKind::ProfileFragment,
+            )
+            .unwrap();
+        assert_eq!(
+            store
+                .reconcile_completed_profile_fragment(
+                    ProfileKey::from(&conflict.header),
+                    conflict_packet.id,
+                    0,
+                    &conflict_payload,
+                )
+                .unwrap(),
+            Some(PersistedFragmentMatch::Conflict)
+        );
+
+        let counters: (i64, i64, i64, i64) = store
+            .connection
+            .query_row(
+                "SELECT duplicate_fragment_count, conflicting_fragment_count,
+                        json_extract(record_json, '$.duplicate_fragment_count'),
+                        json_extract(record_json, '$.conflicting_fragment_count')
+                 FROM v2_profile_scans",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(counters, (1, 1, 1, 1));
+        for (packet_id, expected) in [
+            (duplicate_packet.id, "duplicate"),
+            (conflict_packet.id, "conflict"),
+        ] {
+            let status: String = store
+                .connection
+                .query_row(
+                    "SELECT reassembly_status FROM v2_packet_decodes WHERE packet_id = ?1",
+                    [packet_id],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(status, expected);
+        }
+    }
+
+    #[test]
     fn persists_receiver_missing_fragments_without_fabricating_link_metrics() {
         let mut store = TelemetryStore::open_in_memory().unwrap();
         let encoded = protocol_profile(7);
@@ -1449,6 +1839,52 @@ mod tests {
             )
             .unwrap();
         assert_eq!(row, (0b0100, 0b1011, 0, -4_200));
+    }
+
+    #[test]
+    fn pending_fragment_replay_is_exact_and_refuses_a_silent_prefix() {
+        let mut store = TelemetryStore::open_in_memory().unwrap();
+        let encoded = protocol_profile(8);
+        let mut archived = Vec::new();
+        for index in [2_usize, 0, 1] {
+            let payload = encoded.frames()[index].as_slice();
+            let vesta_protocol::v2::DecodedFrame::ProfileFragment(fragment) =
+                vesta_protocol::v2::decode(payload).unwrap()
+            else {
+                unreachable!()
+            };
+            archived.push(
+                store
+                    .archive_v2_packet(
+                        payload,
+                        radio(),
+                        fragment.header,
+                        V2PacketKind::ProfileFragment,
+                    )
+                    .unwrap(),
+            );
+        }
+        store
+            .mark_fragment_status(archived[1].id, FragmentStorageStatus::Duplicate)
+            .unwrap();
+
+        assert!(matches!(
+            store.pending_profile_fragments(1),
+            Err(StorageError::PendingReplayLimitExceeded {
+                pending: 2,
+                limit: 1
+            })
+        ));
+        assert!(matches!(
+            store.pending_profile_fragments(0),
+            Err(StorageError::InvalidPendingReplayLimit)
+        ));
+        let pending = store.pending_profile_fragments(2).unwrap();
+        assert_eq!(pending.len(), 2);
+        assert_eq!(pending[0].packet_id, archived[0].id);
+        assert_eq!(pending[0].payload, encoded.frames()[2].as_slice());
+        assert_eq!(pending[0].radio, radio());
+        assert_eq!(pending[1].packet_id, archived[2].id);
     }
 
     #[test]
