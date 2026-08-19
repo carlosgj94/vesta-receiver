@@ -1,8 +1,11 @@
-//! Host-side decoding and presentation for Vesta telemetry.
-//!
-//! Radio I/O is deliberately kept out of this crate for now. A Raspberry Pi
-//! backend can pass received payload bytes through [`decode_hex`] or directly
-//! into `vesta_protocol::TelemetryV1::decode` without changing the wire codec.
+//! Host-side decoding, presentation, and Raspberry Pi radio reception for
+//! Vesta telemetry.
+
+pub mod analysis;
+pub mod database;
+pub mod records;
+#[cfg(target_os = "linux")]
+pub mod sx1262;
 
 use core::fmt;
 
@@ -80,6 +83,17 @@ pub enum OutputFormat {
     JsonLines,
 }
 
+/// Signal measurements reported by the SX1262 for one received packet.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+pub struct RadioMetadata {
+    /// Packet RSSI in one hundredth of a decibel-milliwatt.
+    pub packet_rssi_centi_dbm: i16,
+    /// Packet SNR in one hundredth of a decibel.
+    pub snr_centi_db: i16,
+    /// Signal RSSI in one hundredth of a decibel-milliwatt.
+    pub signal_rssi_centi_dbm: i16,
+}
+
 /// Render one decoded frame.
 ///
 /// JSON uses a fixed-width hexadecimal string for `node_id` so JavaScript
@@ -94,6 +108,60 @@ pub fn render(frame: &TelemetryV1, format: OutputFormat) -> Result<String, serde
         OutputFormat::Human => Ok(HumanFrame(frame).to_string()),
         OutputFormat::JsonLines => serde_json::to_string(&JsonFrame::from(frame)),
     }
+}
+
+/// Render a decoded radio frame together with its SX1262 measurements.
+///
+/// # Errors
+///
+/// Returns a serialization error if JSON generation fails.
+pub fn render_received(
+    frame: &TelemetryV1,
+    format: OutputFormat,
+    radio: RadioMetadata,
+) -> Result<String, serde_json::Error> {
+    match format {
+        OutputFormat::Human => Ok(HumanReceivedFrame { frame, radio }.to_string()),
+        OutputFormat::JsonLines => serde_json::to_string(&JsonReceivedFrame {
+            frame: JsonFrame::from(frame),
+            radio,
+        }),
+    }
+}
+
+struct HumanReceivedFrame<'a> {
+    frame: &'a TelemetryV1,
+    radio: RadioMetadata,
+}
+
+impl fmt::Display for HumanReceivedFrame<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "{}", HumanFrame(self.frame))?;
+        writeln!(formatter)?;
+        writeln!(formatter, "  radio:")?;
+        writeln!(
+            formatter,
+            "    packet_rssi: {:.2} dBm",
+            f32::from(self.radio.packet_rssi_centi_dbm) / 100.0
+        )?;
+        writeln!(
+            formatter,
+            "    snr: {:.2} dB",
+            f32::from(self.radio.snr_centi_db) / 100.0
+        )?;
+        write!(
+            formatter,
+            "    signal_rssi: {:.2} dBm",
+            f32::from(self.radio.signal_rssi_centi_dbm) / 100.0
+        )
+    }
+}
+
+#[derive(Serialize)]
+struct JsonReceivedFrame {
+    #[serde(flatten)]
+    frame: JsonFrame,
+    radio: RadioMetadata,
 }
 
 struct HumanFrame<'a>(&'a TelemetryV1);
@@ -384,5 +452,26 @@ mod tests {
         assert!(output.contains("gas_valid: true"));
         assert!(output.contains("temperature_adc: 519888"));
         assert!(output.contains("gas_wait: 6"));
+    }
+
+    #[test]
+    fn received_output_includes_exact_radio_measurements() {
+        let frame = decode_hex(FIXTURE).unwrap();
+        let radio = RadioMetadata {
+            packet_rssi_centi_dbm: -10_050,
+            snr_centi_db: -125,
+            signal_rssi_centi_dbm: -10_250,
+        };
+
+        let json = render_received(&frame, OutputFormat::JsonLines, radio).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(value["radio"]["packet_rssi_centi_dbm"], -10_050);
+        assert_eq!(value["radio"]["snr_centi_db"], -125);
+        assert_eq!(value["node_id"], "0102030405060708");
+
+        let human = render_received(&frame, OutputFormat::Human, radio).unwrap();
+        assert!(human.contains("packet_rssi: -100.50 dBm"));
+        assert!(human.contains("snr: -1.25 dB"));
+        assert!(human.contains("signal_rssi: -102.50 dBm"));
     }
 }

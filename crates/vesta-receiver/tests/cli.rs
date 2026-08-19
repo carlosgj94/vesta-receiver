@@ -82,6 +82,45 @@ fn rejects_protocol_errors_with_nonzero_status() {
     assert!(stderr.contains("unsupported frame version: 2"));
 }
 
+#[test]
+fn help_exposes_rx_only_listen_command() {
+    let output = receiver()
+        .arg("--help")
+        .output()
+        .expect("receiver should start");
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).expect("output should be UTF-8");
+    assert!(stdout.contains("listen"));
+    assert!(stdout.contains("Waveshare SX1262 HAT"));
+}
+
+#[test]
+fn listen_help_documents_default_database() {
+    let output = receiver()
+        .args(["listen", "--help"])
+        .output()
+        .expect("receiver should start");
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).expect("output should be UTF-8");
+    assert!(stdout.contains("--database"));
+    assert!(stdout.contains("data/vesta-telemetry.sqlite3"));
+    assert!(stdout.contains("every PHY-valid radio packet"));
+}
+
+#[test]
+fn rejects_zero_listen_duration_before_accessing_hardware() {
+    let output = receiver()
+        .args(["listen", "--duration", "0"])
+        .output()
+        .expect("receiver should start");
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8(output.stderr).expect("diagnostics should be UTF-8");
+    assert!(stderr.contains("0 is not in 1..=86400"));
+}
+
 #[cfg(target_os = "linux")]
 #[test]
 fn reports_output_flush_failures() {

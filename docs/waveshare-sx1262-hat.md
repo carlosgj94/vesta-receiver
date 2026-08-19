@@ -73,25 +73,74 @@ The Pi must match the transmitter exactly:
 | private sync word | `0x1424` |
 | payload | 48 bytes |
 
-## Planned Rust backend
+## Rust backend
 
-The current implementation plan is an RX-only backend based on:
+`vesta-receiver listen` contains a small board-specific, RX-only SX1262 driver
+built on `rppal`. It uses:
 
-- `lora-phy` 3.0.1 for the SX1262 state machine and LoRa PHY
-- `rppal` for Raspberry Pi SPI/GPIO access across Pi generations
-- Tokio adapters for BUSY and DIO1 edge waits
-- manual chip select on BCM21 for one complete SPI transaction
-- a board-specific RF-switch interface that preserves the valid RX state
+- SPI0 mode 0 at a conservative 500 kHz
+- manual chip select on BCM21 around each complete SPI transaction
+- bounded BUSY waits and DIO1 rising-edge polling
+- explicit LDO regulator mode and the HAT's 32 MHz crystal
+- continuous receive mode with only terminal receive IRQs on DIO1
+- packet RSSI, SNR, and signal RSSI metadata in exact centi-units
 
-The backend will keep these dependencies outside `vesta-protocol`. It will
-yield a received byte slice plus RSSI/SNR metadata, reject header/CRC errors,
-then invoke the existing codec and output layer.
+The driver deliberately contains no transmit opcode or API. BCM6 is claimed as
+an output-high pin before radio setup and is never driven low. On orderly exit,
+the radio enters standby RC while NSS, reset, and BCM6 remain high.
 
-There is one known prerequisite before claiming this path is reliable:
-upstream `lora-phy` 3.0.1 handles `RxDone` even when a CRC-error IRQ is also set.
-We need a small audited patch that rejects header/CRC error flags before reading
-the payload. Until that is implemented and tested, the repository deliberately
-does not expose a misleading `listen` command.
+The IRQ classifier rejects header errors first and CRC errors second, before it
+will accept `RxDone`. This ordering matters because multiple SX1262 IRQ flags
+can be set together. A corrupt payload is never read or passed to the Vesta
+decoder. Payloads with a valid PHY CRC but a length other than 48 bytes, or an
+invalid Vesta header, are also rejected and counted.
+
+The implementation is intentionally direct instead of using `lora-phy` 3.0.1:
+that upstream version processes `RxDone` after merely logging simultaneous
+header/CRC error flags, and its generic RF-switch disable path is not compatible
+with this HAT's two documented switch states.
+
+Run a bounded bring-up without requiring a transmitter:
+
+```sh
+taskset -c 0 cargo run -j1 -p vesta-receiver -- \
+  listen --duration 5 --output jsonl
+```
+
+The settings line and final counters are written to standard error. Valid
+frames are written to standard output, so JSONL can be piped directly to a
+consumer.
+
+## Hardware validation completed
+
+Validated on 2026-08-18 with a Raspberry Pi 5, Raspberry Pi OS 64-bit, and the
+Waveshare 868/915 MHz HAT with its 868 MHz antenna connected:
+
+- SPI0 and all documented GPIOs were available to the unprivileged `spi` and
+  `gpio` groups.
+- Reset/BUSY and `GetStatus` produced a real SX1262 response.
+- The driver read back LoRa packet type, private sync word `0x1424`, and zero
+  device-error flags before entering RX.
+- A five-second listen and a separate three-second canonical `cargo run`
+  completed with exit status 0. No transmitter was active, so all counters
+  correctly remained zero.
+- With the STM32 PCB transmitting once per minute, the receiver accepted and
+  decoded a valid 48-byte frame from node `4fe608a9ee2f303e` with no header,
+  CRC, length, or protocol errors. The captured signal was -42.00 dBm RSSI and
+  12.50 dB SNR.
+- After SQLite persistence was added, the next live frame (sequence 25) was
+  committed as row 1 before printing. A separate read-only connection reported
+  `integrity_check=ok`, WAL journal mode, schema version 1, one row, and an
+  exact 48-byte stored payload.
+- BCM6, reset, and manual NSS remained output-high after exit; the Pi reported
+  `throttled=0x0`.
+
+During initial dependency compilation the Pi unexpectedly rebooted. That
+happened before radio initialization, the prior boot had no persistent journal,
+and the current boot reports neither a PMIC power reset nor throttling. The
+negotiated maximum current is 3000 mA, below the Pi 5's recommended 5 A supply,
+so treat power integrity as an open system-level risk. Single-core, single-job
+builds completed reliably during bring-up.
 
 Relevant implementation references:
 

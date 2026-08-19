@@ -3,15 +3,84 @@
 Rust workspace for receiving and consuming telemetry from Vesta wildfire
 detection nodes.
 
-The current milestone is intentionally split in two:
+The workspace is split into two layers:
 
 - `vesta-protocol` is a dependency-free `no_std` codec for the exact 48-byte
   payload emitted by the embedded firmware.
-- `vesta-receiver` is a host CLI that decodes captured hexadecimal frames into
+- `vesta-receiver` is a host CLI that receives through a Raspberry Pi
+  Waveshare SX1262 HAT or decodes captured hexadecimal frames. It emits
   human-readable text or exact-integer JSONL.
 
-Direct reception from the Raspberry Pi's Waveshare SX1262 HAT is the next
-milestone. It is not implemented or hardware-validated yet.
+## Listen on Raspberry Pi
+
+On a Raspberry Pi with SPI enabled and the 868 MHz antenna attached:
+
+```sh
+taskset -c 0 cargo run -j1 -p vesta-receiver -- listen --output jsonl
+```
+
+For a bounded hardware smoke test that succeeds even if no transmitter is
+currently active:
+
+```sh
+taskset -c 0 cargo run -j1 -p vesta-receiver -- \
+  listen --duration 5 --output jsonl
+```
+
+Use `--count N` to stop after `N` valid frames. Diagnostics and the final
+counter summary go to standard error, leaving standard output as clean JSONL.
+Every PHY-valid packet is committed to `data/vesta-telemetry.sqlite3`; decoded
+version-1 frames are then linked to their raw packet before being printed.
+Unknown future records and decoder failures are archived rather than silently
+dropped. Override the location with `--database PATH`.
+The driver is RX-only: it exposes no transmit command, keeps the HAT's BCM6 RF
+control in its documented RX state, and returns the radio to standby when the
+process exits normally or receives SIGINT/SIGTERM.
+
+The one-core, one-job prefix is recommended for this Pi until it has a verified
+5 A supply. It affects compilation only; the receiver itself is lightweight.
+
+## SQLite telemetry storage
+
+The schema-version-2 database retains one `telemetry_readings` row per valid
+legacy observation and an exact `radio_packets` row for every PHY-valid LoRa
+payload. A schema-version-1 database is migrated transactionally. Legacy
+telemetry preserves:
+
+- UTC receive time, fixed-width node ID, protocol version, and sequence
+- exact status bits plus decoded status flags
+- every corrected and raw BME688 field in its integer wire unit
+- packet RSSI, SNR, and signal RSSI in exact centi-units
+- the original 48-byte payload as a BLOB for later audit or reprocessing
+
+The additional structured tables are ready for version-2 device configuration,
+multi-step BME688 profiles, fragment provenance, and device-health records.
+Protocol-independent validation and feature extraction provide quality flags,
+per-minute environmental rates, and heater-profile gas shape without claiming
+to classify a fire. See [Server-side analysis](docs/server-analysis.md).
+
+Repeated node/sequence pairs are retained because the transmitter sequence is
+a wrapping counter, not a permanent database identity. SQLite uses WAL mode,
+full synchronous commits, a five-second busy timeout, schema versioning, and
+indexes for recent global/per-node readings. The generated `data/` directory is
+ignored by Git.
+
+Example query:
+
+```sql
+SELECT
+  datetime(received_at_unix_ms / 1000, 'unixepoch') AS received_utc,
+  node_id,
+  sequence,
+  temperature_centi_celsius / 100.0 AS temperature_c,
+  pressure_pascal / 100.0 AS pressure_hpa,
+  humidity_milli_percent_rh / 1000.0 AS humidity_percent,
+  packet_rssi_centi_dbm / 100.0 AS rssi_dbm,
+  snr_centi_db / 100.0 AS snr_db
+FROM telemetry_readings
+ORDER BY received_at_unix_ms DESC
+LIMIT 20;
+```
 
 ## Try the decoder
 
@@ -49,9 +118,8 @@ crates/
 └── vesta-receiver/  # host CLI and presentation layer
 ```
 
-The future Raspberry Pi/SX1262 implementation will be isolated from both of
-these crates so Linux GPIO/SPI dependencies never enter the portable protocol
-layer.
+Raspberry Pi GPIO/SPI dependencies are Linux-only and remain outside the
+portable `vesta-protocol` crate.
 
 ## Validation
 
@@ -59,17 +127,23 @@ layer.
 cargo fmt --all -- --check
 cargo test --workspace --all-targets --all-features --locked
 cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
-cargo check -p vesta-protocol --no-default-features --target thumbv7em-none-eabi
+RUSTDOCFLAGS='-D warnings' cargo doc --workspace --all-features --no-deps --locked
+cargo check -p vesta-protocol --no-default-features --target thumbv7em-none-eabi --locked
 ```
 
 The tests include the byte-for-byte fixture shared with the transmitter,
 signed and unsigned boundaries, all truncated lengths, protocol failures, hex
-input failures, JSON units, CLI exit codes, and mixed valid/invalid streams.
+input failures, JSON units, CLI exit codes, mixed valid/invalid streams, SX1262
+IRQ precedence, frequency configuration, packet-status conversion, exact
+SQLite inserts, raw-packet archival, schema migration, structured configuration,
+profile and health storage, quality gates, feature extraction, duplicate
+observations, and schema-version rejection.
 
 ## Protocol and radio
 
 - [Version 1 wire format](docs/wire-format-v1.md)
 - [Waveshare SX1262 Raspberry Pi bring-up](docs/waveshare-sx1262-hat.md)
+- [Server-side analysis and version-2 integration](docs/server-analysis.md)
 
 This project uses private raw LoRa P2P, not LoRaWAN. PHY CRC detects accidental
 transmission corruption; it does not authenticate or encrypt a packet.
