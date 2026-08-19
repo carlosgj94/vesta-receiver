@@ -1,0 +1,20 @@
+[Unit]
+Description=Vesta SX1262 telemetry receiver
+Wants=network-online.target
+After=network-online.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+WorkingDirectory=%h/Projects/embedded/vesta-receiver-release
+ExecStart=%h/Projects/embedded/vesta-receiver-release/target/release/vesta-receiver listen --output jsonl --database %h/Projects/embedded/vesta-receiver/data/vesta-telemetry.sqlite3
+Restart=on-failure
+RestartSec=3s
+TimeoutStopSec=15s
+NoNewPrivileges=yes
+PrivateTmp=yes
+LockPersonality=yes
+UMask=0077
+
+[Install]
+WantedBy=default.target
