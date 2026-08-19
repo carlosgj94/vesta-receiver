@@ -36,7 +36,9 @@ queryable columns so no less-common configuration field is lost.
 The Rust/JSON configuration field is `readback_heater_current`. The SQL column
 retains the draft schema-v2 compatibility name `programmed_heater_current` to
 avoid a destructive migration; its value is exact raw `IDAC_HEAT` readback,
-not a claim that the driver programmed IDAC.
+not a claim that the driver programmed IDAC. It is the canonical configuration
+snapshot; each profile step separately preserves the live readback, which may
+drift without representing a configuration change.
 
 Opening schema version 1 or the prior draft schema version 2 migrates
 transactionally. Draft record tables are not rebuilt or deleted. For a schema-2
@@ -118,8 +120,11 @@ join a validated `DeviceConfiguration` matching the node, config ID, profile
 ID/revision, expected step count, and every received step's target temperature,
 duration, and repetition multiplier. Final resolution requires the sensor
 configuration-read-back flag and a readback-valid bitmap covering every
-expected step; every raw heater-current, heater-resistance, and gas-wait byte
-must then match its step descriptor. `extract_profile_features` therefore
+expected step; every programmed heater-resistance and gas-wait byte must then
+match its step descriptor. Raw `IDAC_HEAT` is deliberately not an equality
+gate because this driver does not program it and the live per-scan value can
+drift; both the canonical configuration snapshot and live profile value remain
+stored for diagnostics. `extract_profile_features` therefore
 leaves `configuration_resolved=false` and final `usable_for_analysis=false`;
 `extract_profile_features_with_configuration` sets them only for a validated
 match. The features can be recomputed when a repeated configuration packet

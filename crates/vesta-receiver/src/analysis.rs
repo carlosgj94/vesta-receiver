@@ -468,10 +468,13 @@ pub fn extract_profile_features_with_configuration(
                 && configured.target_temperature_celsius == step.target_temperature_celsius
                 && configured.configured_duration_us == step.configured_duration_us
                 && configured.repetition_multiplier == step.repetition_multiplier;
-            let readback_matches = configured.readback_heater_current == step.raw_heater_current
-                && configured.programmed_heater_resistance == step.raw_heater_resistance
+            // IDAC_HEAT is read-only metadata for this driver and can drift
+            // between otherwise identical scans. Preserve its live value in
+            // the profile step, but do not treat it as a programmed setting.
+            let programmed_readback_matches = configured.programmed_heater_resistance
+                == step.raw_heater_resistance
                 && configured.programmed_gas_wait == step.raw_gas_wait;
-            descriptor_matches && readback_matches
+            descriptor_matches && programmed_readback_matches
         });
     extract_profile_features_inner(scan, configuration_resolved)
 }
@@ -845,21 +848,28 @@ mod tests {
         let unresolved = extract_profile_features_with_configuration(&scan, &wrong_configuration);
         assert!(!unresolved.configuration_resolved);
         assert!(!unresolved.usable_for_analysis);
-        for field in 0..6 {
+        for field in 0..5 {
             let mut mismatched = matching_configuration(&scan);
             match field {
                 0 => mismatched.heater_steps[0].target_temperature_celsius += 1,
                 1 => mismatched.heater_steps[0].configured_duration_us += 1,
                 2 => mismatched.heater_steps[0].repetition_multiplier += 1,
-                3 => mismatched.heater_steps[0].readback_heater_current += 1,
-                4 => mismatched.heater_steps[0].programmed_heater_resistance += 1,
-                5 => mismatched.heater_steps[0].programmed_gas_wait += 1,
+                3 => mismatched.heater_steps[0].programmed_heater_resistance += 1,
+                4 => mismatched.heater_steps[0].programmed_gas_wait += 1,
                 _ => unreachable!(),
             }
             let features = extract_profile_features_with_configuration(&scan, &mismatched);
             assert!(!features.configuration_resolved, "mismatched field {field}");
             assert!(!features.usable_for_analysis);
         }
+        let configuration = matching_configuration(&scan);
+        let mut current_drift = scan.clone();
+        for step in &mut current_drift.steps {
+            step.raw_heater_current = step.raw_heater_current.wrapping_add(1);
+        }
+        let features = extract_profile_features_with_configuration(&current_drift, &configuration);
+        assert!(features.configuration_resolved);
+        assert!(features.usable_for_analysis);
         let mut missing_readback_flag = matching_configuration(&scan);
         missing_readback_flag.config_flags &= !CONFIG_FLAG_SENSOR_CONFIG_READ_BACK;
         assert!(missing_readback_flag.validate().is_ok());

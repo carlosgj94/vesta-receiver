@@ -231,7 +231,8 @@ pub struct HeaterStepConfig {
     /// Bosch parallel-mode TPHG repetition multiplier; zero outside parallel
     /// mode (and retains Bosch's special zero semantics if ever configured).
     pub repetition_multiplier: u8,
-    /// Read-back `IDAC_HEATn`; read-only metadata, not an expected-value check.
+    /// Canonical `IDAC_HEATn` snapshot. This is read-only metadata, not an
+    /// expected-value check; live profile-step readback may differ.
     pub readback_heater_current: u8,
     /// Read-back `RES_HEATn`; meaningful only when the corresponding bit in
     /// `heater_readback_valid_bitmap` is set.

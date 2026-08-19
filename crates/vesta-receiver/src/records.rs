@@ -30,7 +30,8 @@ pub struct HeaterStepConfiguration {
     pub target_temperature_celsius: u16,
     pub configured_duration_us: u32,
     pub repetition_multiplier: u8,
-    /// Exact raw `IDAC_HEAT` readback; IDAC is not programmed by this driver.
+    /// Canonical raw `IDAC_HEAT` snapshot. IDAC is not programmed by this
+    /// driver, so a profile's live readback may differ without a config change.
     pub readback_heater_current: u8,
     pub programmed_heater_resistance: u8,
     pub programmed_gas_wait: u8,
