@@ -792,6 +792,25 @@ fn validate_config(config: &DeviceConfig) -> Result<(), Error> {
     if config.profile_id == 0 || config.profile_version == 0 {
         return Err(Error::InvalidField("profile_identity"));
     }
+    if config.sensor_variant != 0 && config.sensor_variant != 1 && config.sensor_variant != u8::MAX
+    {
+        return Err(Error::InvalidField("sensor_variant"));
+    }
+    if config.temperature_oversampling > 5
+        || config.humidity_oversampling > 5
+        || config.pressure_oversampling > 5
+    {
+        return Err(Error::InvalidField("oversampling"));
+    }
+    if config.iir_filter > 7 {
+        return Err(Error::InvalidField("iir_filter"));
+    }
+    if config.standby_time > 8 {
+        return Err(Error::InvalidField("standby_time"));
+    }
+    if !(1..=3).contains(&config.operation_mode) {
+        return Err(Error::InvalidField("operation_mode"));
+    }
     if !(1..=MAX_PROFILE_STEPS_U8).contains(&config.expected_step_count) {
         return Err(Error::InvalidField("expected_step_count"));
     }
@@ -816,11 +835,25 @@ fn validate_config(config: &DeviceConfig) -> Result<(), Error> {
         if config.calibration_hash_algorithm != 0 || config.calibration_hash != 0 {
             return Err(Error::InvalidField("calibration_hash"));
         }
-    } else if config.calibration_hash_algorithm == 0 {
+    } else if config.calibration_hash_algorithm != 1 {
         return Err(Error::InvalidField("calibration_hash_algorithm"));
     }
     if config.firmware_build_flags & BUILD_FLAG_ID_VALID == 0 && config.firmware_build_id != 0 {
         return Err(Error::InvalidField("firmware_build_id"));
+    }
+    if !(5..=12).contains(&config.radio_spreading_factor) {
+        return Err(Error::InvalidField("radio_spreading_factor"));
+    }
+    if config.radio_bandwidth_hz == 0 {
+        return Err(Error::InvalidField("radio_bandwidth_hz"));
+    }
+    if config.radio_coding_rate_numerator != 4
+        || !(5..=8).contains(&config.radio_coding_rate_denominator)
+    {
+        return Err(Error::InvalidField("radio_coding_rate"));
+    }
+    if config.radio_preamble_symbols == 0 {
+        return Err(Error::InvalidField("radio_preamble_symbols"));
     }
     for (index, step) in config.steps.iter().enumerate() {
         if index >= usize::from(config.expected_step_count) && *step != HeaterStepConfig::default()
@@ -2208,6 +2241,64 @@ mod tests {
                 field: "output_routes",
                 bits: 0x80,
             })
+        );
+
+        for (field, mutate) in [
+            (
+                "sensor_variant",
+                (|config: &mut DeviceConfig| config.sensor_variant = 2) as fn(&mut DeviceConfig),
+            ),
+            (
+                "oversampling",
+                (|config: &mut DeviceConfig| config.temperature_oversampling = 6)
+                    as fn(&mut DeviceConfig),
+            ),
+            (
+                "iir_filter",
+                (|config: &mut DeviceConfig| config.iir_filter = 8) as fn(&mut DeviceConfig),
+            ),
+            (
+                "standby_time",
+                (|config: &mut DeviceConfig| config.standby_time = 9) as fn(&mut DeviceConfig),
+            ),
+            (
+                "operation_mode",
+                (|config: &mut DeviceConfig| config.operation_mode = 0) as fn(&mut DeviceConfig),
+            ),
+            (
+                "radio_spreading_factor",
+                (|config: &mut DeviceConfig| config.radio_spreading_factor = 13)
+                    as fn(&mut DeviceConfig),
+            ),
+            (
+                "radio_bandwidth_hz",
+                (|config: &mut DeviceConfig| config.radio_bandwidth_hz = 0)
+                    as fn(&mut DeviceConfig),
+            ),
+            (
+                "radio_coding_rate",
+                (|config: &mut DeviceConfig| config.radio_coding_rate_numerator = 3)
+                    as fn(&mut DeviceConfig),
+            ),
+            (
+                "radio_preamble_symbols",
+                (|config: &mut DeviceConfig| config.radio_preamble_symbols = 0)
+                    as fn(&mut DeviceConfig),
+            ),
+        ] {
+            let mut malformed = config();
+            mutate(&mut malformed);
+            assert_eq!(
+                encode_device_config(common(0), &malformed, false),
+                Err(Error::InvalidField(field))
+            );
+        }
+
+        let mut unknown_calibration_hash = config();
+        unknown_calibration_hash.calibration_hash_algorithm = 2;
+        assert_eq!(
+            encode_device_config(common(0), &unknown_calibration_hash, false),
+            Err(Error::InvalidField("calibration_hash_algorithm"))
         );
     }
 
